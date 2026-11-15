@@ -97,10 +97,22 @@ local function Client(opts)
             SetOwner = function(self, owner) self.owner = owner end,
             SetHyperlink = function(self, link) self.link = link; self.lines = {} end,
             AddLine = function(self, text) self.lines = self.lines or {}; self.lines[#self.lines + 1] = text end,
-            SetItemKey = function(self, id, ilvl, suffix) self.itemKey = { id, ilvl, suffix } end,
+            -- opts.scanMode picks which of the three reads gives the real suffixed link: "displayed",
+            -- "data" or "getitem"; the others (and every read by default) give the generic link.
+            SetItemKey = function(self, id, ilvl, suffix, req)
+                self.itemKey = { id, ilvl, suffix, req }
+                C.setItemKeys = C.setItemKeys or {}
+                C.setItemKeys[#C.setItemKeys + 1] = req and 4 or 3
+                if not opts.noScan then
+                    self.processingInfo = { tooltipData = { hyperlink = opts.scanMode == "data"
+                        and C.realLink(id, suffix) or C.genericLink(id) } }
+                end
+            end,
             GetItem = function(self)
                 if opts.noScan or not self.itemKey then return nil end
-                return C.keyLink(self.itemKey[1], self.itemKey[3])
+                local id, suffix = self.itemKey[1], self.itemKey[3]
+                if opts.scanMode == "getitem" then return C.suffixName(id, suffix), C.realLink(id, suffix) end
+                return C.items[id].name, C.genericLink(id)
             end,
         }
         setmetatable(w, { __index = function(_, k)
@@ -116,8 +128,8 @@ local function Client(opts)
 
     -- Items: id -> { name, quality, equipLoc, cached }. Suffix names by suffix id.
     local items = opts.items
-    local suffixes = { [1200] = " of the Bear", [1001] = " of Healing", [1002] = " of the Whale",
-        [1003] = " of Intellect" }
+    local suffixes = { [1200] = " of the Bear", [14315] = " of Healing", [14301] = " of the Whale",
+        [14309] = " of Intellect" }
     C.items, C.requested = items, {}
 
     local function parse(s)
@@ -130,27 +142,57 @@ local function Client(opts)
     end
     C.parse = parse
 
-    -- The real (suffixed) name and link of an item key.
-    function C.keyLink(id, suffix)
+    function C.suffixName(id, suffix) return items[id].name .. (suffixes[suffix] or "") end
+
+    -- As in the game: the generic link the client gives for an item id (key tooltip, scan tooltip, item
+    -- info of a bare item string): no suffix, maybe an existing bonus ID (it.bonus).
+    function C.genericLink(id)
         local it = items[id]
-        local name = it.name .. (suffix ~= 0 and (suffixes[suffix] or "") or "")
-        local istr = suffix ~= 0 and ("item:" .. id .. "::::::" .. suffix) or ("item:" .. id)
-        return name, "|cff1eff00|H" .. istr .. "::::::::60:::::|h[" .. name .. "]|h|r"
+        local f = { tostring(id), "", "", "", "", "", "", "", "10", "1486", "", "" }
+        f[13] = it.bonus and tostring(#it.bonus) or ""
+        for _, b in ipairs(it.bonus or {}) do f[#f + 1] = tostring(b) end
+        for _ = 1, 6 do f[#f + 1] = "" end
+        return "|cnIQ" .. (it.quality or 2) .. ":|Hitem:" .. table.concat(f, ":") .. "|h[" .. it.name .. "]|h|r"
     end
 
-    -- As seen in the game: a constructed item string with a suffix resolves to the base item; a full
-    -- hyperlink keeps its suffix.
+    -- The real link of a suffixed item as this client writes it (one bonus ID, its own link level).
+    function C.realLink(id, suffix)
+        local f = { tostring(id), "", "", "", "", "", "", "", "15", "1486", "", "", "1", tostring(suffix),
+            "", "", "", "", "", "" }
+        return "|cnIQ" .. (items[id].quality or 2) .. ":|Hitem:" .. table.concat(f, ":") .. "|h["
+            .. C.suffixName(id, suffix) .. "]|h|r"
+    end
+
+    -- The suffix the client reads from a hyperlink, per opts.suffixMode: "bonus" (a single bonus ID, the
+    -- default), "bonus+" (the last of two or more bonus IDs), "field" (field 7), "none".
+    function C.linkSuffix(s)
+        local payload = type(s) == "string" and s:match("|Hitem:([^|]*)|h")
+        if not payload then return 0 end
+        local f = {}
+        for x in (payload .. ":"):gmatch("([^:]*):") do f[#f + 1] = x end
+        local mode, n = opts.suffixMode or "bonus", tonumber(f[13]) or 0
+        local b
+        if mode == "bonus" and n == 1 then b = tonumber(f[14]) end
+        if mode == "bonus+" and n >= 2 then b = tonumber(f[13 + n]) end
+        if mode == "field" then b = tonumber(f[7]) end
+        return (b and suffixes[b]) and b or 0
+    end
+
+    -- A bare item string (with or without a suffix) resolves to the base item and the generic link; a
+    -- hyperlink resolves to the item its payload describes (unless opts.resolveVia == "tooltip": then only
+    -- C_TooltipInfo.GetHyperlink shows the suffixed name) and keeps its link.
     local function getItemInfo(s)
         count("GetItemInfo")
-        local id, suffix
-        if type(s) == "number" then id, suffix = s, 0 else id, suffix = parse(s) end
+        local id
+        if type(s) == "number" then id = s else id = parse(s) end
         local it = id and items[id]
         if not it or not it.cached then return nil end
         local name, link
         if type(s) == "string" and s:find("|H", 1, true) then
-            name, link = C.keyLink(id, suffix)
+            name = C.suffixName(id, opts.resolveVia == "tooltip" and 0 or C.linkSuffix(s))
+            link = s
         else
-            name, link = C.keyLink(id, 0)
+            name, link = it.name, C.genericLink(id)
         end
         local loc = it.secretFull and C.SECRET or it.equipLoc
         return name, link, it.quality or 2, 60, 55, "Armor", "Plate", 1, loc, "icon" .. id
@@ -170,14 +212,32 @@ local function Client(opts)
     G.UIParent = widget("Frame")
     G.WorldFrame = widget("Frame")
     if not opts.noKeyTooltip then
-        G.C_TooltipInfo = { GetItemKey = function(id, ilvl, suffix)
-            count("GetItemKeyTooltip")
-            local it = items[id]
-            if not it or not it.cached then return nil end
-            local _, link = C.keyLink(id, suffix)
-            return { type = 0, hyperlink = link, lines = {} }
-        end }
+        G.C_TooltipInfo = {
+            GetItemKey = function(id)
+                count("GetItemKeyTooltip")
+                local it = items[id]
+                if not it or not it.cached then return nil end
+                -- generic, as in the game
+                return { type = 0, hyperlink = C.genericLink(id), lines = { { leftText = it.name }, { leftText = "Chest" } } }
+            end,
+            GetHyperlink = function(link)
+                count("GetHyperlinkTooltip")
+                local id = parse(link)
+                local it = id and items[id]
+                if not it or not it.cached then return nil end
+                local suffix = C.linkSuffix(link)
+                local lines = { { leftText = C.suffixName(id, suffix) }, { leftText = "Chest" } }
+                if suffix ~= 0 then lines[3] = { leftText = "+5" .. suffixes[suffix] } end
+                return { type = 0, lines = lines }
+            end,
+        }
     end
+    G.TooltipUtil = { GetDisplayedItem = function(tip)
+        local k = rawget(tip, "itemKey")
+        if opts.noScan or not k then return nil end
+        if opts.scanMode == "displayed" then return C.suffixName(k[1], k[3]), C.realLink(k[1], k[3]) end
+        return items[k[1]].name, C.genericLink(k[1])
+    end }
     G.SlashCmdList = {}
     G.BackdropTemplateMixin = {}
     G.GameTooltip = widget("GameTooltip")
@@ -218,13 +278,14 @@ local function Client(opts)
             return out
         end,
         HasFullBrowseResults = function() return C.full end,
+        GetItemKeyRequiredLevel = function() return opts.reqLevel end,
         MakeItemKey = function(id, ilvl, suffix)
             return { itemID = id, itemLevel = ilvl or 0, itemSuffix = suffix or 0, battlePetSpeciesID = 0 }
         end,
         GetItemKeyInfo = function(key)
             local it = items[key.itemID]
             if not it or not it.cached or it.keyInfoLoaded == false then return nil end
-            local name = C.keyLink(key.itemID, key.itemSuffix or 0)
+            local name = C.suffixName(key.itemID, key.itemSuffix or 0)
             return { itemID = key.itemID, itemName = name, quality = it.quality or 2, iconFileID = "icon" .. key.itemID,
                 isEquipment = it.equipLoc ~= "", isCommodity = false, isPet = false }
         end,
@@ -260,7 +321,7 @@ local function Client(opts)
                 if not name then return nil, "NOT_CACHED" end
                 link = fullLink or link
                 if equipLoc == "" then return nil, "NOT_EQUIPPABLE" end
-                local id, suffix = parse(link)
+                local id, suffix = parse(link), C.linkSuffix(link)
                 local p = pct[id .. ":" .. suffix]
                 if p == nil then p = pct[id] end
                 if p == "NOT_USABLE" then return nil, "NOT_USABLE" end
@@ -672,7 +733,7 @@ test("slash commands", function()
     ok(C.printedSince(n, "Rows: 69 %(gear 66, upgrades 64; scored 65, pending 0 of which resolving 0, unusable 1, "
         .. "error 0, not gear 3%)"), "rows line")
     ok(C.printedSince(n, "sort Value descending"), "panel line")
-    ok(C.printedSince(n, "Links: key tooltip 66, scan tooltip 0, item info 0; 0 suffixed rows judged as the base item"),
+    ok(C.printedSince(n, "Links: keytooltip 65, suffixbonus 1; 0 suffixed rows judged as the base item"),
         "link sources")
     n = #C.printed
     C.slash("debug")
@@ -686,8 +747,8 @@ test("slash commands", function()
     ok(C.printedSince(n, "1 of 69 rows match \"CLOAK\":"), "debug lookup header")
     ok(C.printedSince(n, "102:1200 Bandit's Cloak of the Bear: scored; upgrade 3, item 50 vs equipped 40 %(slot 5%); "
         .. "price 20000, value 1.5; shown"), "debug lookup row")
-    ok(C.printedSince(n, "id 102 suffix 1200 ilvl 60, item:102::::::1200, INVTYPE_CLOAK, link %(keytooltip%) "
-        .. "|cff1eff00|Hitem:102::::::1200:.*, SGJ judged |cff1eff00|Hitem:102::::::1200:"), "debug lookup second line")
+    ok(C.printedSince(n, "id 102 suffix 1200 ilvl 60, item:102::::::1200, INVTYPE_CLOAK, link %(suffixbonus%) "
+        .. "|cnIQ2:|Hitem:102::::::::10:1486:::1:1200:.*, SGJ judged |cnIQ2:|Hitem:102::::::::10:1486:::1:1200:"), "debug lookup second line")
     n = #C.printed
     C.slash("debug item:201")
     ok(C.printedSince(n, "201:0 %-: notgear %(EQUIP_LOC%).*hidden: not gear"), "hidden not-gear row (no name: found by item string)")
@@ -827,19 +888,24 @@ end)
 -- Random suffix items: "Cadet Vest of ..." (GetItemInfo of a suffixed item string gives the base item)
 ---------------------------------------------------------------------------
 
--- 1% at 4s49c, 4% at 5g, 6% at 15g50s; the base item would be 2.5%.
-local CADET_PCT = { [501] = 2.5, ["501:1001"] = 1, ["501:1002"] = 4, ["501:1003"] = 6 }
+-- Suffix IDs from the in-game dump (itemID 9765 there). 1% at 4s49c, 4% at 5g, 6% at 15g50s; the base item
+-- would be 2.5%.
+local HEALING, WHALE, INTELLECT = 14315, 14301, 14309
+local CADET_PCT = { [501] = 2.5, ["501:" .. HEALING] = 1, ["501:" .. WHALE] = 4, ["501:" .. INTELLECT] = 6 }
+local CADET_NAMES = "Cadet Vest of Healing,Cadet Vest of the Whale,Cadet Vest of Intellect"
 
 local function cadet(copts)
-    local list = { [501] = { name = "Cadet Vest", quality = 2, equipLoc = "INVTYPE_CHEST", cached = true } }
+    -- the generic link carries an existing bonus ID, as in the game (1:3524)
+    local list = { [501] = { name = "Cadet Vest", quality = 2, equipLoc = "INVTYPE_CHEST", cached = true, bonus = { 3524 } } }
     if copts.keyInfoLate then list[501].keyInfoLoaded = false end
-    local X = Client({ items = list, sgj = CADET_PCT, noKeyTooltip = copts.noKeyTooltip, noScan = copts.noScan })
+    local X = Client({ items = list, sgj = CADET_PCT, noKeyTooltip = copts.noKeyTooltip, noScan = copts.noScan,
+        suffixMode = copts.suffixMode, resolveVia = copts.resolveVia, scanMode = copts.scanMode, reqLevel = copts.reqLevel })
     X.load()
     X.fire("ADDON_LOADED", "AuctionJudge")
     X.openAH()
-    X.results = { result(501, 449, 1001), result(501, 50000, 1002), result(501, 155000, 1003) }
+    X.results = { result(501, 449, HEALING), result(501, 50000, WHALE), result(501, 155000, INTELLECT) }
     X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
-    X.advance(0.6)
+    X.advance(copts.wait or 0.6)
     return X, list
 end
 
@@ -858,30 +924,79 @@ local function clean(X)
     eq(#X.forbidden, 0, "forbidden auction house calls: " .. table.concat(X.forbidden, ", "))
 end
 
-test("random suffixes: real names and links from the item key, distinct scores (key tooltip)", function()
-    local X = cadet({})
-    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of the Whale,Cadet Vest of Intellect", "distinct names")
+-- Every row: the source, a link with the suffix in the expected place, SGJ judged that link, all distinct.
+local function distinct(X, source, part)
+    eq(X.rowNames(), CADET_NAMES, "distinct names")
     eq(upgrades(X), "+1.0%,+4.0%,+6.0%", "distinct scores, none marked")
     local seen = {}
     for _, row in ipairs(X.ns.store.rows) do
-        eq(row.linkSource, "keytooltip", "source")
-        ok(row.link:find("item:501::::::" .. row.suffix .. ":", 1, true), "link carries the suffix: " .. row.link)
-        ok(row.sgjLink:find("item:501::::::" .. row.suffix .. ":", 1, true), "SGJ judged the suffixed link")
+        eq(row.linkSource, source, "source")
+        local want = part:gsub("SUFFIX", tostring(row.suffix))
+        ok(row.link:find(want, 1, true), "link carries the suffix (" .. want .. "): " .. row.link)
+        eq(row.sgjLink, row.link, "SGJ judged that link")
         ok(not seen[row.link], "links distinct")
         seen[row.link] = true
-        ok(X.ns.store.scores[row.link], "score cached per suffixed link")
+        ok(X.ns.store.scores[row.link], "score cached per link")
     end
-    for _, l in ipairs(X.scoredLinks) do ok(l:find("|H", 1, true), "SGJ got a hyperlink, not the item string: " .. l) end
+end
+
+local function sources(row)
+    local out = {}
+    for i, c in ipairs(row.candidates) do out[i] = c.source .. (c.accepted and "!" or "") end
+    return table.concat(out, ",")
+end
+
+test("random suffixes: key tooltip link generic, bonus list 1:<suffix> verifies", function()
+    local X = cadet({})
+    distinct(X, "suffixbonus", ":::1:SUFFIX::")
+    local row = X.ns.store.rows[1]
+    eq(sources(row), "keytooltip,scan:displayed,scan:data,scan:getitem,suffixbonus!,suffixbonus+,suffixfield",
+        "every candidate recorded, the first verified one accepted")
+    eq(row.candidates[1].name, "Cadet Vest", "the generic key link resolves to the base name")
+    eq(row.candidates[5].name, "Cadet Vest of Healing", "the accepted one to the suffixed name")
+    ok(row.link:find("|cnIQ2:|Hitem:501::::::::10:1486:::1:" .. HEALING .. "::::::|h[Cadet Vest of Healing]|h|r", 1, true),
+        "payload and colour prefix kept, name set: " .. row.link)
+    for _, l in ipairs(X.scoredLinks) do ok(l:find("|H", 1, true), "SGJ got a hyperlink: " .. l) end
+    local n = #X.printed
+    X.slash("debug whale")
+    ok(X.printedSince(n, "try keytooltip: item info Cadet Vest, tooltip Cadet Vest: "), "debug: rejected candidate")
+    ok(X.printedSince(n, "try suffixbonus: item info Cadet Vest of the Whale, tooltip %- ACCEPTED: "), "debug: accepted")
     X.closeAH()
-    eq(X.G.AuctionJudgeDB.lastDump.rows[1].linkSource, "keytooltip", "source in the dump")
-    eq(X.G.AuctionJudgeDB.lastDump.linkSources.keytooltip, 3, "source counts in the dump")
+    local d = X.G.AuctionJudgeDB.lastDump
+    eq(d.rows[1].linkSource, "suffixbonus", "source in the dump")
+    eq(d.linkSources.suffixbonus, 3, "source counts in the dump")
+    eq(#d.rows[1].candidates, 7, "candidates in the dump")
+    eq(d.rows[1].candidates[5].accepted, true, "accepted in the dump")
+    eq(d.rows[1].sgjLink, d.rows[1].link, "SGJ's link in the dump")
+    eq(d.suffixSample.key, "501:" .. HEALING, "tooltip sample for the first suffixed row")
+    eq(table.concat(d.suffixSample.keyTooltipLines, "|"), "Cadet Vest|Chest", "key tooltip lines")
+    eq(table.concat(d.suffixSample.linkTooltipLines, "|"), "Cadet Vest of Healing|Chest|+5 of Healing",
+        "judged link tooltip lines")
     clean(X)
 end)
 
-test("random suffixes without C_TooltipInfo: the private scan tooltip gives the link", function()
-    local X = cadet({ noKeyTooltip = true })
-    eq(upgrades(X), "+1.0%,+4.0%,+6.0%", "distinct scores")
-    eq(X.ns.store.rows[1].linkSource, "scantooltip", "source")
+test("random suffixes: only the appended bonus list (2:3524:<suffix>) verifies", function()
+    local X = cadet({ suffixMode = "bonus+" })
+    distinct(X, "suffixbonus+", ":::2:3524:SUFFIX::")
+    clean(X)
+end)
+
+test("random suffixes: the item info name is the base name, the tooltip name verifies", function()
+    local X = cadet({ resolveVia = "tooltip" })
+    distinct(X, "suffixbonus", ":::1:SUFFIX::")
+    local c = X.ns.store.rows[1].candidates[5]
+    eq(c.name .. " / " .. c.tooltipName, "Cadet Vest / Cadet Vest of Healing", "resolved through C_TooltipInfo.GetHyperlink")
+    clean(X)
+end)
+
+test("random suffixes: the scan tooltip's GetItem gives the real link (also tried with the required level)", function()
+    local X = cadet({ scanMode = "getitem", reqLevel = 12 })
+    distinct(X, "scan:getitem", ":::::15:1486:::1:SUFFIX:")
+    eq(sources(X.ns.store.rows[1]), "keytooltip,keytooltip+lvl,scan:displayed,scan:data,scan:getitem!,scan:displayed+lvl,"
+        .. "scan:data+lvl,scan:getitem+lvl,suffixbonus,suffixbonus+,suffixfield", "order: key, scan, then built links")
+    local three, four = 0, 0
+    for _, nargs in ipairs(X.setItemKeys) do if nargs == 4 then four = four + 1 else three = three + 1 end end
+    ok(three >= 3 and four >= 3, "SetItemKey with 3 and 4 arguments: " .. three .. "/" .. four)
     local tips = {}
     for _, w in ipairs(X.widgets) do if rawget(w, "template") == "GameTooltipTemplate" then tips[#tips + 1] = w end end
     eq(#tips, 1, "one scan tooltip")
@@ -889,25 +1004,27 @@ test("random suffixes without C_TooltipInfo: the private scan tooltip gives the 
     ok(tips[1].owner == X.G.WorldFrame, "owned by WorldFrame")
     local n = #X.printed
     X.slash("status")
-    ok(X.printedSince(n, "Links: key tooltip 0, scan tooltip 3, item info 0; 0 suffixed"), "status counts per source")
+    ok(X.printedSince(n, "Links: scan:getitem 3; 0 suffixed"), "status counts per source")
     X.closeAH()
     clean(X)
 end)
 
-test("random suffixes with neither tooltip: waits for item key info, then marks base scores with *", function()
-    local X, list = cadet({ noKeyTooltip = true, noScan = true, keyInfoLate = true })
-    ok(X.G.AuctionJudgeDB and #X.shownRows() == 0, "nothing listed while waiting")
-    eq(X.ns.store.rows[1].reason, "ITEM_KEY_INFO", "waiting for item key info")
-    local driver
-    for _, w in ipairs(X.widgets) do if w.events.ITEM_KEY_ITEM_INFO_RECEIVED then driver = w end end
-    ok(driver, "ITEM_KEY_ITEM_INFO_RECEIVED registered")
-    list[501].keyInfoLoaded = true
-    X.fire("ITEM_KEY_ITEM_INFO_RECEIVED", 501)
-    X.advance(0.5)
-    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of the Whale,Cadet Vest of Intellect", "names from item key info")
+test("random suffixes: TooltipUtil.GetDisplayedItem is read first", function()
+    local X = cadet({ scanMode = "displayed" })
+    distinct(X, "scan:displayed", ":::::15:1486:::1:SUFFIX:")
+    clean(X)
+end)
+
+test("random suffixes: nothing verifies: base score marked with * after bounded retries", function()
+    local X = cadet({ suffixMode = "none", wait = 0.6 })
+    eq(#X.shownRows(), 0, "nothing listed while retrying")
+    eq(X.ns.store.rows[1].reason, "SUFFIX_LINK", "retrying the candidates")
+    X.advance(6)
+    eq(X.rowNames(), CADET_NAMES, "suffixed names from the item key")
     eq(upgrades(X), "+2.5%*,+2.5%*,+2.5%*", "base scores marked")
     local row = X.ns.store.rows[1]
     eq(row.linkSource .. " " .. tostring(row.approximate), "iteminfo true", "fallback recorded")
+    for _, c in ipairs(row.candidates) do ok(not c.accepted, "no candidate accepted") end
     eq(X.ns.store.info[row.itemString], nil, "approximate info not cached")
     local b = X.shownRows()[1]
     b.scripts.OnEnter(b)
@@ -920,6 +1037,22 @@ test("random suffixes with neither tooltip: waits for item key info, then marks 
     clean(X)
 end)
 
+test("random suffixes with neither tooltip: waits for item key info, then builds from the item info link", function()
+    local X, list = cadet({ noKeyTooltip = true, noScan = true, keyInfoLate = true })
+    eq(#X.shownRows(), 0, "nothing listed while waiting")
+    eq(X.ns.store.rows[1].reason, "ITEM_KEY_INFO", "waiting for item key info")
+    local driver
+    for _, w in ipairs(X.widgets) do if w.events.ITEM_KEY_ITEM_INFO_RECEIVED then driver = w end end
+    ok(driver, "ITEM_KEY_ITEM_INFO_RECEIVED registered")
+    list[501].keyInfoLoaded = true
+    X.fire("ITEM_KEY_ITEM_INFO_RECEIVED", 501)
+    X.advance(0.5)
+    distinct(X, "suffixbonus", ":::1:SUFFIX::")
+    eq(sources(X.ns.store.rows[1]), "suffixbonus!,suffixbonus+,suffixfield", "built from the item info link")
+    X.closeAH()
+    clean(X)
+end)
+
 test("random suffix whose item key info never arrives: base name, marked, after a bounded wait", function()
     local X = cadet({ noKeyTooltip = true, noScan = true, keyInfoLate = true })
     X.advance(5)
@@ -928,7 +1061,6 @@ test("random suffix whose item key info never arrives: base name, marked, after 
     X.closeAH()
     clean(X)
 end)
-
 ---------------------------------------------------------------------------
 -- Session without Sharpie's Gear Judge
 ---------------------------------------------------------------------------

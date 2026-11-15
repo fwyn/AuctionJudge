@@ -184,7 +184,70 @@ function M.MergeInfo(base, keyInfo, keyLink, keySource, suffix)
     }
 end
 
----Rows per link source ("keytooltip", "scantooltip", "iteminfo"), resolved rows only.
+---Splits an item hyperlink "<prefix>|Hitem:<payload>|h[<name>]|h<tail>". Payload fields after "item:":
+---1 itemID, 2 enchant, 3-6 gems, 7 suffix, 8 unique, 9 link level, 10 spec, 11 modifiers mask,
+---12 item context, 13 number of bonus IDs, 14.. the bonus IDs, then the rest (kept as is).
+---Returns { prefix, head (fields 1-12), bonus (list), rest (list), name, tail } or nil.
+function M.ParseLink(link)
+    if type(link) ~= "string" then return nil end
+    local prefix, payload, name, tail = link:match("^(.-)|Hitem:([^|]*)|h%[(.-)%]|h(.*)$")
+    if not payload then return nil end
+    local f = {}
+    for x in (payload .. ":"):gmatch("([^:]*):") do f[#f + 1] = x end
+    local head, bonus, rest = {}, {}, {}
+    for i = 1, 12 do head[i] = f[i] or "" end
+    local n = tonumber(f[13]) or 0
+    local i = 14
+    while #bonus < n and f[i] ~= nil do
+        bonus[#bonus + 1] = f[i]
+        i = i + 1
+    end
+    while f[i] ~= nil do
+        rest[#rest + 1] = f[i]
+        i = i + 1
+    end
+    return { prefix = prefix, head = head, bonus = bonus, rest = rest, name = name, tail = tail }
+end
+
+local function buildLink(p, head, bonus, name)
+    local f = {}
+    for i = 1, 12 do f[i] = head[i] end
+    f[13] = #bonus > 0 and tostring(#bonus) or ""
+    for _, b in ipairs(bonus) do f[#f + 1] = tostring(b) end
+    for _, r in ipairs(p.rest) do f[#f + 1] = r end
+    return p.prefix .. "|Hitem:" .. table.concat(f, ":") .. "|h[" .. name .. "]|h" .. p.tail
+end
+
+---Candidate links for a random suffix, built from a base hyperlink, in the order to try:
+---  suffixbonus   bonus list replaced by 1:<suffix>
+---  suffixbonus+  existing bonus IDs kept, the suffix appended (left out when it equals the first)
+---  suffixfield   the legacy form: suffix in field 7, no bonus IDs
+---The display name becomes name (the item key's suffixed name). Returns a list of { source, link }.
+function M.SuffixCandidates(baseLink, suffix, name)
+    local p = M.ParseLink(baseLink)
+    if not p then return {} end
+    suffix = tostring(suffix)
+    name = name or p.name
+    local out, seen = {}, {}
+    local function add(source, link)
+        if seen[link] then return end
+        seen[link] = true
+        out[#out + 1] = { source = source, link = link }
+    end
+    add("suffixbonus", buildLink(p, p.head, { suffix }, name))
+    local more = {}
+    for _, b in ipairs(p.bonus) do more[#more + 1] = b end
+    more[#more + 1] = suffix
+    add("suffixbonus+", buildLink(p, p.head, more, name))
+    local legacy = {}
+    for i = 1, 12 do legacy[i] = p.head[i] end
+    legacy[7] = suffix
+    add("suffixfield", buildLink(p, legacy, {}, name))
+    return out
+end
+
+---Rows per link source (keytooltip[+lvl], scan:displayed / scan:data / scan:getitem[+lvl], suffixbonus,
+---suffixbonus+, suffixfield, iteminfo), resolved rows only.
 function M.LinkSourceCounts(store)
     local c = {}
     for _, row in ipairs(store.rows) do
@@ -211,6 +274,7 @@ function M.ApplyInfo(store, row, info, now)
     row.link = info.link or row.itemString
     row.linkSource = info.linkSource or "iteminfo"
     row.approximate = info.approximate == true
+    row.baseLink, row.candidates = info.baseLink, info.candidates
     row.sortName = type(info.name) == "string" and info.name:lower() or ""
     if not M.IsGear(info.equipLoc) then
         setState(store, row, "notgear")
@@ -418,7 +482,19 @@ function M.DumpRow(row, opts)
         upgradePct = row.upgradePct, itemScore = row.itemScore, equippedScore = row.equippedScore, slot = row.slot,
         price = row.price, value = row.value, shown = hidden == nil, hiddenBy = hidden,
         linkSource = row.linkSource, approximate = row.approximate == true, sgjLink = row.sgjLink,
+        baseLink = row.baseLink, candidates = M.CopyCandidates(row.candidates),
     }
+end
+
+---Suffix link candidates as plain values: { source, link, name (GetItemInfo), tooltipName, accepted }.
+function M.CopyCandidates(list)
+    if not list then return nil end
+    local out = {}
+    for i, c in ipairs(list) do
+        out[i] = { source = c.source, link = c.link, name = c.name, tooltipName = c.tooltipName,
+            accepted = c.accepted == true }
+    end
+    return out
 end
 
 M.APPROXIMATE_NOTE = "base item score, suffix not resolved"
@@ -461,15 +537,22 @@ end
 
 local function v(x) return x == nil and "-" or tostring(x) end
 
----Two lines for /aj debug.
+---Lines for /aj debug: two per row, plus one per suffix link candidate tried.
 function M.DebugLines(d)
+    local extra = {}
+    if d.baseLink then extra[#extra + 1] = "    suffix: base link " .. d.baseLink end
+    for _, c in ipairs(d.candidates or {}) do
+        extra[#extra + 1] = format("    try %s: item info %s, tooltip %s%s: %s", c.source, v(c.name), v(c.tooltipName),
+            c.accepted and " ACCEPTED" or "", c.link)
+    end
     return format("%s %s: %s%s%s; upgrade %s, item %s vs equipped %s (slot %s); price %s, value %s; %s",
             d.key, v(d.name), d.state, d.reason and (" (" .. d.reason .. ")") or "",
             d.sgjReason and (" SGJ " .. d.sgjReason) or "", v(d.upgradePct), v(d.itemScore), v(d.equippedScore),
             v(d.slot), v(d.price), v(d.value), d.shown and "shown" or ("hidden: " .. d.hiddenBy)),
         format("    id %s suffix %s ilvl %s, %s, %s, link (%s) %s, SGJ judged %s%s", v(d.itemID), v(d.itemSuffix),
             v(d.itemLevel), v(d.itemString), v(d.equipLoc), v(d.linkSource), v(d.link), v(d.sgjLink),
-            d.approximate and ("; " .. M.APPROXIMATE_NOTE) or "")
+            d.approximate and ("; " .. M.APPROXIMATE_NOTE) or ""),
+        extra
 end
 
 local RANK = { scored = 0, pending = 1, error = 2, unusable = 3 }

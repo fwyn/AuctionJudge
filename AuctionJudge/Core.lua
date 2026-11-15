@@ -126,7 +126,34 @@ local function readResults()
     markDirty()
 end
 
-local KEY_WAITS = 2 -- tries a suffixed row waits for item key info when no key link is readable
+local KEY_WAITS = 2    -- tries a suffixed row waits for item key info (its suffixed name)
+local SUFFIX_TRIES = 3 -- tries a suffixed row waits for one of its candidate links to resolve
+
+---The verified link of a random suffix row: the first candidate whose resolved name is the item key's
+---suffixed name. Candidates: every link the client gives for the item key (key tooltip, scan tooltip),
+---then links built from the first of them (or the item info link) with the suffix as a bonus ID or in
+---field 7. Every candidate is resolved and recorded. Returns link, source; or nil when none verified.
+local function suffixLink(row, base, keyInfo)
+    local list = Game.KeyLinks(row.itemID, row.itemLevel, row.suffix)
+    local baseLink = list[1] and list[1].link or base.link
+    for _, c in ipairs(M.SuffixCandidates(baseLink, row.suffix, keyInfo.name)) do list[#list + 1] = c end
+    row.baseLink, row.candidates = baseLink, list
+    local resolved, accepted = {}, nil
+    for _, c in ipairs(list) do
+        local r = resolved[c.link]
+        if not r then
+            r = { Game.ResolveLinkName(c.link, base.name) }
+            resolved[c.link] = r
+        end
+        c.name, c.tooltipName = r[1], r[2]
+        if not accepted and (c.name == keyInfo.name or c.tooltipName == keyInfo.name) then
+            c.accepted = true
+            accepted = c
+        end
+    end
+    if accepted then return accepted.link, accepted.source end
+    return nil
+end
 
 local function work(row, now)
     if not row.info then
@@ -136,16 +163,32 @@ local function work(row, now)
             M.Defer(store, row, now, "ITEM_INFO")
             return
         end
-        -- the real name and link come from the item key: GetItemInfo of a suffixed item string can give
-        -- the base item
+        -- The real name comes from the item key. GetItemInfo of a suffixed item string gives the base item,
+        -- and the key tooltip link is generic for the item id: the suffixed link has to be built and checked.
         local keyInfo = Game.ItemKeyInfo(row.itemID, row.itemLevel, row.suffix)
-        local keyLink, source = Game.KeyLink(row.itemID, row.itemLevel, row.suffix)
-        if not keyLink and not keyInfo and row.suffix ~= 0 and (row.keyWaits or 0) < KEY_WAITS then
-            row.keyWaits = (row.keyWaits or 0) + 1
-            M.Defer(store, row, now, "ITEM_KEY_INFO")
-            return
+        local keyLink, source
+        if row.suffix == 0 then
+            keyLink, source = Game.KeyLink(row.itemID, row.itemLevel, row.suffix)
+        elseif M.IsGear(base.equipLoc) then
+            if not keyInfo and (row.keyWaits or 0) < KEY_WAITS then
+                row.keyWaits = (row.keyWaits or 0) + 1
+                M.Defer(store, row, now, "ITEM_KEY_INFO")
+                return
+            end
+            if keyInfo then
+                keyLink, source = suffixLink(row, base, keyInfo)
+                if not keyLink and (row.suffixTries or 0) < SUFFIX_TRIES then
+                    row.suffixTries = (row.suffixTries or 0) + 1
+                    M.Defer(store, row, now, "SUFFIX_LINK")
+                    return
+                end
+            else
+                keyLink, source = nil, nil -- no suffixed name to check against: judged as the base item
+            end
         end
-        M.ApplyInfo(store, row, M.MergeInfo(base, keyInfo, keyLink, source, row.suffix), now)
+        local info = M.MergeInfo(base, keyInfo, keyLink, source, row.suffix)
+        info.baseLink, info.candidates = row.baseLink, row.candidates
+        M.ApplyInfo(store, row, info, now)
         -- not gear, a cached outcome, or an unknown equip location deferred for a retry
         if row.state ~= "pending" or not row.info then return end
     end
@@ -282,6 +325,17 @@ local function writeDump(why)
     d.sgjReady = Game.SGJReady()
     d.spec = Game.SpecName()
     d.lastReadError = lastReadError
+    -- the first suffixed row's tooltip text, key tooltip vs the judged link, to compare stats by eye
+    for _, row in ipairs(store.rows) do
+        if row.suffix ~= 0 and row.info and row.state ~= "notgear" then
+            d.suffixSample = {
+                key = row.key, name = row.name, link = row.link, linkSource = row.linkSource,
+                keyTooltipLines = Game.KeyTooltipLines(row.itemID, row.itemLevel, row.suffix, 12),
+                linkTooltipLines = Game.LinkTooltipLines(row.link, 12),
+            }
+            break
+        end
+    end
     ns.db.lastDump = d
 end
 
@@ -371,9 +425,16 @@ local function status()
     local sources = M.LinkSourceCounts(store)
     local approx = 0
     for _, row in ipairs(store.rows) do if row.approximate then approx = approx + 1 end end
-    ns.Print(string.format("Links: key tooltip %d, scan tooltip %d, item info %d; %d suffixed rows judged as the base "
-        .. "item (*); C_TooltipInfo.GetItemKey %s", sources.keytooltip or 0, sources.scantooltip or 0,
-        sources.iteminfo or 0, approx, yesno(type(C_TooltipInfo) == "table" and C_TooltipInfo.GetItemKey)))
+    local parts = {}
+    local names = {}
+    for name in pairs(sources) do names[#names + 1] = name end
+    table.sort(names)
+    for _, name in ipairs(names) do parts[#parts + 1] = name .. " " .. sources[name] end
+    if #parts == 0 then parts[1] = "none yet" end
+    local TI = C_TooltipInfo
+    ns.Print(string.format("Links: %s; %d suffixed rows judged as the base item (*); C_TooltipInfo.GetItemKey %s, "
+        .. "GetHyperlink %s", table.concat(parts, ", "), approx, yesno(type(TI) == "table" and TI.GetItemKey),
+        yesno(type(TI) == "table" and TI.GetHyperlink)))
     local db = ns.db
     ns.Print(string.format("Panel: %s, %s; upgrades only %s, hide unusable %s, sort %s",
         Panel.Exists() and "created" or "not created", db.shown and "on" or "off", yesno(db.upgradesOnly),
@@ -385,9 +446,10 @@ local function debugFind(text)
     local found = M.FindRows(store, text)
     ns.Print(string.format("%d of %d rows match \"%s\":", #found, #store.rows, text))
     for _, row in ipairs(found) do
-        local a, b = M.DebugLines(M.DumpRow(row, ns.db))
+        local a, b, extra = M.DebugLines(M.DumpRow(row, ns.db))
         ns.Print(a)
         ns.Print(b)
+        for _, line in ipairs(extra) do ns.Print(line) end
     end
 end
 

@@ -194,30 +194,141 @@ local function scanTooltip()
     return scanTip or nil
 end
 
----The item key's link and where it came from ("keytooltip", "scantooltip"), or nil.
-function Game.KeyLink(itemID, itemLevel, itemSuffix)
-    itemLevel, itemSuffix = itemLevel or 0, itemSuffix or 0
+---The required level the auction house knows for an item key (the 4th SetItemKey argument), or nil.
+function Game.RequiredLevel(itemID, itemLevel, itemSuffix)
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.GetItemKeyRequiredLevel) ~= "function" then return nil end
+    local ok, level = pcall(AH.GetItemKeyRequiredLevel, makeItemKey(itemID, itemLevel, itemSuffix))
+    level = ok and plain(level)
+    if type(level) == "number" then return level end
+    return nil
+end
+
+---The key tooltip data from C_TooltipInfo.GetItemKey, or nil.
+local function keyTooltipData(itemID, itemLevel, itemSuffix, reqLevel)
     local TI = C_TooltipInfo
-    if type(TI) == "table" and type(TI.GetItemKey) == "function" then
-        local ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix)
-        if ok and type(data) == "table" and not isSecret(data) then
-            local ok2, link = pcall(function() return checkLink(data.hyperlink, itemID) end)
-            if ok2 and link then return link, "keytooltip" end
+    if type(TI) ~= "table" or type(TI.GetItemKey) ~= "function" then return nil end
+    local ok, data
+    if reqLevel then
+        ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix, reqLevel)
+    else
+        ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix)
+    end
+    if ok and type(data) == "table" and not isSecret(data) then return data end
+    return nil
+end
+
+---Sets the hidden scan tooltip to the item key and reads its link the three ways SGJ reads a shown
+---tooltip: TooltipUtil.GetDisplayedItem, processingInfo.tooltipData.hyperlink, GetItem.
+local function scanItemKey(itemID, itemLevel, itemSuffix, reqLevel, tag, out)
+    local tip = scanTooltip()
+    if not tip then return end
+    local ok = pcall(function()
+        tip:SetOwner(WorldFrame or UIParent, "ANCHOR_NONE")
+        tip:ClearLines()
+        if reqLevel then
+            tip:SetItemKey(itemID, itemLevel, itemSuffix, reqLevel)
+        else
+            tip:SetItemKey(itemID, itemLevel, itemSuffix)
+        end
+    end)
+    if ok then
+        local TU = TooltipUtil
+        if type(TU) == "table" and type(TU.GetDisplayedItem) == "function" then
+            local ok2, _, link = pcall(TU.GetDisplayedItem, tip)
+            link = ok2 and checkLink(link, itemID)
+            if link then out[#out + 1] = { source = "scan:displayed" .. tag, link = link } end
+        end
+        local ok3, link3 = pcall(function()
+            local info = tip.processingInfo
+            local data = type(info) == "table" and info.tooltipData
+            return type(data) == "table" and checkLink(data.hyperlink, itemID) or nil
+        end)
+        if ok3 and link3 then out[#out + 1] = { source = "scan:data" .. tag, link = link3 } end
+        local ok4, _, link4 = pcall(function() return tip:GetItem() end)
+        link4 = ok4 and checkLink(link4, itemID)
+        if link4 then out[#out + 1] = { source = "scan:getitem" .. tag, link = link4 } end
+    end
+    pcall(function() tip:Hide() end)
+end
+
+---Links the client gives for an item key, in the order to try: { source, link }. Sources: keytooltip,
+---keytooltip+lvl (with the required level), scan:displayed, scan:data, scan:getitem (and +lvl). With
+---first = true only the first one is looked for (rows without a random suffix).
+function Game.KeyLinks(itemID, itemLevel, itemSuffix, first)
+    itemLevel, itemSuffix = itemLevel or 0, itemSuffix or 0
+    local out = {}
+    local data = keyTooltipData(itemID, itemLevel, itemSuffix)
+    if data then
+        local ok, link = pcall(function() return checkLink(data.hyperlink, itemID) end)
+        if ok and link then out[#out + 1] = { source = "keytooltip", link = link } end
+    end
+    if first and out[1] then return out end
+    local reqLevel = not first and Game.RequiredLevel(itemID, itemLevel, itemSuffix) or nil
+    if reqLevel then
+        local data2 = keyTooltipData(itemID, itemLevel, itemSuffix, reqLevel)
+        if data2 then
+            local ok, link = pcall(function() return checkLink(data2.hyperlink, itemID) end)
+            if ok and link then out[#out + 1] = { source = "keytooltip+lvl", link = link } end
         end
     end
-    local tip = scanTooltip()
-    if tip then
-        local ok, link = pcall(function()
-            tip:SetOwner(WorldFrame or UIParent, "ANCHOR_NONE")
-            tip:ClearLines()
-            tip:SetItemKey(itemID, itemLevel, itemSuffix)
-            local _, l = tip:GetItem()
-            tip:Hide()
-            return checkLink(l, itemID)
-        end)
-        if ok and link then return link, "scantooltip" end
-    end
+    scanItemKey(itemID, itemLevel, itemSuffix, nil, "", out)
+    if first then return out end
+    if reqLevel then scanItemKey(itemID, itemLevel, itemSuffix, reqLevel, "+lvl", out) end
+    return out
+end
+
+---The first link the client gives for an item key and its source, or nil.
+function Game.KeyLink(itemID, itemLevel, itemSuffix)
+    local c = Game.KeyLinks(itemID, itemLevel, itemSuffix, true)[1]
+    if c then return c.link, c.source end
     return nil
+end
+
+local function textLines(data, max)
+    local out = {}
+    if type(data) ~= "table" or type(data.lines) ~= "table" then return out end
+    for i = 1, max do
+        local line = data.lines[i]
+        if type(line) ~= "table" then break end
+        local text = plain(line.leftText)
+        out[i] = type(text) == "string" and text or ""
+    end
+    return out
+end
+
+---Up to max left-hand text lines of the key tooltip data (for the diagnostic dump).
+function Game.KeyTooltipLines(itemID, itemLevel, itemSuffix, max)
+    local ok, lines = pcall(textLines, keyTooltipData(itemID, itemLevel or 0, itemSuffix or 0), max)
+    return ok and lines or {}
+end
+
+---Up to max left-hand text lines of C_TooltipInfo.GetHyperlink(link) (for the diagnostic dump).
+function Game.LinkTooltipLines(link, max)
+    local TI = C_TooltipInfo
+    if type(TI) ~= "table" or type(TI.GetHyperlink) ~= "function" or type(link) ~= "string" then return {} end
+    local ok, lines = pcall(function() return textLines(TI.GetHyperlink(link), max) end)
+    return ok and lines or {}
+end
+
+---The names a link resolves to without any query: GetItemInfo's name, and when that is missing or the
+---base name, the first tooltip line from C_TooltipInfo.GetHyperlink. Either may be nil.
+function Game.ResolveLinkName(link, baseName)
+    local info = Game.ItemInfo(link)
+    local itemName = info and info.name
+    local tipName
+    if not itemName or itemName == baseName then
+        local TI = C_TooltipInfo
+        if type(TI) == "table" and type(TI.GetHyperlink) == "function" then
+            local ok, name = pcall(function()
+                local data = TI.GetHyperlink(link)
+                local line = type(data) == "table" and not isSecret(data) and type(data.lines) == "table" and data.lines[1]
+                return type(line) == "table" and plain(line.leftText) or nil
+            end)
+            if ok and type(name) == "string" and name ~= "" then tipName = name end
+        end
+    end
+    return itemName, tipName
 end
 
 ---The item's base name (without a random suffix), for searching.

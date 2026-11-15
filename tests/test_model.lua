@@ -526,6 +526,39 @@ test("random suffix info: key name and link win, base link only is approximate",
     eq((c.iteminfo or 0) .. " " .. (c.keytooltip or 0), "1 1", "source counts")
 end)
 
+test("link payload parsing: bonus IDs, item context, prefix and tail", function()
+    local p = M.ParseLink("|cnIQ2:|Hitem:9765::::::::10:1486:::1:3524::::::|h[Cadet Vest]|h|r")
+    eq(p.prefix .. " " .. p.name .. " " .. p.tail, "|cnIQ2: Cadet Vest |r", "parts")
+    eq(p.head[1] .. " " .. p.head[9] .. " " .. p.head[10] .. " [" .. p.head[12] .. "]", "9765 10 1486 []", "fields")
+    eq(table.concat(p.bonus, ","), "3524", "bonus IDs")
+    eq(#p.rest, 6, "rest kept")
+    local q = M.ParseLink("|Hitem:11981::::::::20:1485::1:1:12724::::::|h[Lead Band of the Falcon]|h")
+    eq(q.head[12], "1", "item context")
+    eq(table.concat(q.bonus, ","), "12724", "bonus after the context")
+    local r = M.ParseLink("|cff1eff00|Hitem:102::::::::10:1486:::::::::|h[Cloak]|h|r")
+    eq(#r.bonus, 0, "no bonus IDs")
+    eq(M.ParseLink("item:102"), nil, "not a hyperlink")
+end)
+
+test("suffix candidates: bonus list replaced, appended, legacy field 7; display name set", function()
+    local c = M.SuffixCandidates("|cnIQ2:|Hitem:9765::::::::10:1486:::1:3524::::::|h[Cadet Vest]|h|r", 14315,
+        "Cadet Vest of Healing")
+    eq(#c, 3, "three candidates")
+    eq(c[1].source .. " " .. c[1].link,
+        "suffixbonus |cnIQ2:|Hitem:9765::::::::10:1486:::1:14315::::::|h[Cadet Vest of Healing]|h|r", "(a)")
+    eq(c[2].source .. " " .. c[2].link,
+        "suffixbonus+ |cnIQ2:|Hitem:9765::::::::10:1486:::2:3524:14315::::::|h[Cadet Vest of Healing]|h|r", "(b)")
+    local legacy = M.ParseLink(c[3].link)
+    eq(c[3].source .. " " .. legacy.head[7] .. " " .. #legacy.bonus .. " " .. legacy.head[9] .. " " .. #legacy.rest,
+        "suffixfield 14315 0 10 6", "(c): suffix in field 7, no bonus IDs, the rest kept")
+    local ctx = M.SuffixCandidates("|Hitem:11981::::::::20:1485::1:1:12724::::::|h[Lead Band]|h", 999, "Lead Band of X")
+    eq(ctx[1].link, "|Hitem:11981::::::::20:1485::1:1:999::::::|h[Lead Band of X]|h", "item context kept")
+    local plain = M.SuffixCandidates("|cff1eff00|Hitem:102::::::::10:1486:::::::::|h[Cloak]|h|r", 1200, "Cloak of the Bear")
+    eq(#plain, 2, "without bonus IDs (b) equals (a): left out")
+    eq(plain[1].link, "|cff1eff00|Hitem:102::::::::10:1486:::1:1200::::::|h[Cloak of the Bear]|h|r", "(a) added a list")
+    eq(#M.SuffixCandidates("item:102", 1200, "x"), 0, "no hyperlink, no candidates")
+end)
+
 test("count line", function()
     local store = scoredStore(SPEC)
     M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },
