@@ -12,6 +12,8 @@ M.BATCH_INTERVAL = 0.1  -- seconds between batches
 M.RETRY_BASE = 0.5      -- first retry delay for a pending row, doubled per try
 M.RETRY_MAX = 5         -- longest retry delay
 M.MAX_TRIES = 12        -- a row still pending after this many tries becomes an error (about 45 s)
+M.MAX_SKIPPED = 100     -- browse results without a row of their own kept for diagnostics
+M.MAX_DUMP_ROWS = 400   -- rows in the saved diagnostic dump
 
 ---------------------------------------------------------------------------
 -- Items
@@ -96,6 +98,7 @@ end
 ---Forgets the rows (the auction house closed); the session caches stay.
 function M.Clear(store)
     store.rows, store.byKey, store.byItem = {}, {}, {}
+    store.skipped, store.skippedCount = {}, 0
     store.lastCount = 0
     store.full = nil
     recount(store)
@@ -103,13 +106,18 @@ end
 
 local function resetScore(store, row)
     row.upgradePct, row.value, row.specName, row.equipped, row.reason = nil, nil, nil, nil, nil
+    row.itemScore, row.equippedScore, row.slot, row.sgjReason = nil, nil, nil, nil
     setState(store, row, "pending")
     row.tries, row.nextTry = 0, 0
     markDue(store, 0)
 end
 
 local function setScore(store, row, result, reason)
+    row.sgjReason = (not result) and reason or nil
     if result then
+        -- plain numbers only (kept for diagnostics)
+        row.itemScore, row.equippedScore, row.slot =
+            tonumber(result.itemScore), tonumber(result.equippedScore), tonumber(result.slot)
         local pct = tonumber(result.upgradePct)
         if pct then
             setState(store, row, "scored")
@@ -181,9 +189,11 @@ function M.ApplyScore(store, row, result, reason, now)
         store.scores[row.link] = { result = result, reason = (not result) and reason or nil }
     elseif reason == "NOT_CACHED" or reason == "NOT_READY" then
         M.Defer(store, row, now, reason)
+        row.sgjReason = reason
     else
         setState(store, row, "error")
         row.reason = reason or "ERROR"
+        row.sgjReason = reason
     end
 end
 
@@ -191,17 +201,29 @@ end
 ---equipLoc (optional instant hint, nil when unknown) }. One row per item string (item level variants
 ---merge); the lowest price wins. Rows already known keep their state; new rows take item info and
 ---scores from the session caches.
-function M.Rebuild(store, entries)
+---skipped (optional): browse results already left out by the reader, { itemID, itemSuffix, reason };
+---entries that do not become rows of their own are added to it (for diagnostics, up to MAX_SKIPPED).
+function M.Rebuild(store, entries, skipped)
     local old = store.byKey
     local rows, byKey, byItem = {}, {}, {}
+    local skip, skipCount = {}, 0
+    local function skipEntry(s)
+        skipCount = skipCount + 1
+        if #skip < M.MAX_SKIPPED then skip[#skip + 1] = s end
+    end
+    for _, s in ipairs(skipped or {}) do skipEntry(s) end
     for _, e in ipairs(entries) do
         local id = tonumber(e.itemID)
-        if id and id > 0 then
+        if not (id and id > 0) then
+            skipEntry({ itemID = id, itemSuffix = tonumber(e.itemSuffix), reason = "bad item id" })
+        else
             local suffix, ilvl = tonumber(e.itemSuffix) or 0, tonumber(e.itemLevel) or 0
             local key = M.RowKey(id, suffix)
             local price = tonumber(e.minPrice)
             local row = byKey[key]
             if row then
+                skipEntry({ itemID = id, itemSuffix = suffix, itemLevel = ilvl, price = price,
+                    reason = "merged into row " .. key .. " (lowest price kept)" })
                 if price and (not row.price or price < row.price) then
                     row.price, row.quantity, row.itemLevel = price, tonumber(e.totalQuantity), ilvl
                 end
@@ -231,6 +253,7 @@ function M.Rebuild(store, entries)
     end
     store.rows, store.byKey, store.byItem = rows, byKey, byItem
     store.lastCount = #entries
+    store.skipped, store.skippedCount = skip, skipCount
     recount(store)
 end
 
@@ -312,17 +335,93 @@ end
 M.COLUMNS = { "name", "price", "upgrade", "value" }
 M.DEFAULT_DESC = { name = false, price = false, upgrade = true, value = true }
 
----Rows to list: resolved gear only; options { upgradesOnly, hideUnusable }.
+---Why a row is not listed, or nil when it is. options { upgradesOnly, hideUnusable }.
+function M.HiddenReason(row, opts)
+    local s = row.state
+    if s == "notgear" then return "not gear" end
+    if not row.info then return s == "pending" and "item info not loaded" or "item info failed" end
+    if s == "unusable" and (opts.hideUnusable or opts.upgradesOnly) then return "unusable" end
+    if opts.upgradesOnly then
+        if s == "scored" then
+            if row.upgradePct > 0 then return nil end
+            return "not an upgrade"
+        end
+        if s == "pending" then return "not scored yet (upgrades only)" end
+        return "scoring failed (upgrades only)"
+    end
+    return nil
+end
+
+---Rows to list: resolved gear only, as the options allow.
 function M.Filter(store, opts)
     local out = {}
     for _, row in ipairs(store.rows) do
-        local s = row.state
-        local show = row.info and s ~= "notgear"
-        if show and opts.upgradesOnly then show = s == "scored" and row.upgradePct > 0 end
-        if show and opts.hideUnusable then show = s ~= "unusable" end
-        if show then out[#out + 1] = row end
+        if not M.HiddenReason(row, opts) then out[#out + 1] = row end
     end
     return out
+end
+
+---------------------------------------------------------------------------
+-- Diagnostics (built on demand only: the dump on close/logout, /aj debug <text>)
+---------------------------------------------------------------------------
+
+---A row as plain values.
+function M.DumpRow(row, opts)
+    local hidden = M.HiddenReason(row, opts)
+    return {
+        key = row.key, itemID = row.itemID, itemSuffix = row.suffix, itemLevel = row.itemLevel,
+        itemString = row.itemString, name = row.name, link = row.link, equipLoc = row.equipLoc,
+        state = row.state, reason = row.reason, sgjReason = row.sgjReason,
+        upgradePct = row.upgradePct, itemScore = row.itemScore, equippedScore = row.equippedScore, slot = row.slot,
+        price = row.price, value = row.value, shown = hidden == nil, hiddenBy = hidden,
+    }
+end
+
+---Rows whose name (or item string) contains text, case-insensitive.
+function M.FindRows(store, text)
+    local needle = text:lower()
+    local out = {}
+    for _, row in ipairs(store.rows) do
+        local hay = (row.name or "") .. " " .. (row.itemString or "")
+        if hay:lower():find(needle, 1, true) then out[#out + 1] = row end
+    end
+    return out
+end
+
+---The diagnostic dump: settings, counts, rows (judged rows first, then not-gear rows, in browse order,
+---up to MAX_DUMP_ROWS) and the browse results without a row of their own.
+function M.Dump(store, opts)
+    local rows = {}
+    for pass = 1, 2 do
+        for _, row in ipairs(store.rows) do
+            if #rows >= M.MAX_DUMP_ROWS then break end
+            if (row.state == "notgear") == (pass == 2) then rows[#rows + 1] = M.DumpRow(row, opts) end
+        end
+    end
+    local skipped = {}
+    for i, s in ipairs(store.skipped or {}) do
+        skipped[i] = { itemID = s.itemID, itemSuffix = s.itemSuffix, itemLevel = s.itemLevel, price = s.price,
+            reason = s.reason }
+    end
+    return {
+        filters = { upgradesOnly = opts.upgradesOnly == true, hideUnusable = opts.hideUnusable == true,
+            sortColumn = opts.sortColumn, sortDesc = opts.sortDesc == true },
+        counts = M.Counts(store),
+        rawCount = store.lastCount, full = store.full, rowCount = #store.rows,
+        rows = rows, skipped = skipped, skippedCount = store.skippedCount or 0,
+    }
+end
+
+local function v(x) return x == nil and "-" or tostring(x) end
+
+---Two lines for /aj debug.
+function M.DebugLines(d)
+    return format("%s %s: %s%s%s; upgrade %s, item %s vs equipped %s (slot %s); price %s, value %s; %s",
+            d.key, v(d.name), d.state, d.reason and (" (" .. d.reason .. ")") or "",
+            d.sgjReason and (" SGJ " .. d.sgjReason) or "", v(d.upgradePct), v(d.itemScore), v(d.equippedScore),
+            v(d.slot), v(d.price), v(d.value), d.shown and "shown" or ("hidden: " .. d.hiddenBy)),
+        format("    id %s suffix %s ilvl %s, %s, %s, link %s", v(d.itemID), v(d.itemSuffix), v(d.itemLevel),
+            v(d.itemString), v(d.equipLoc), v(d.link))
 end
 
 local RANK = { scored = 0, pending = 1, error = 2, unusable = 3 }
@@ -421,13 +520,16 @@ function M.FormatUpgrade(row)
     return "error", "bad"
 end
 
----"0.84 %/g"; empty without a value.
-function M.FormatValue(v)
+---Value text: v is % per gold. Shown per silver ("0.84 %/s") when the price is under 1 gold, per gold
+---("0.84 %/g") otherwise; sorting always uses v itself. Empty without a value.
+function M.FormatValue(v, price)
     if type(v) ~= "number" then return "" end
-    if v >= 100 then return format("%.0f %%/g", v) end
-    if v >= 10 then return format("%.1f %%/g", v) end
-    if v >= 0.01 then return format("%.2f %%/g", v) end
-    return format("%.2g %%/g", v)
+    local unit = "g"
+    if type(price) == "number" and price < 10000 then v, unit = v / 100, "s" end
+    if v >= 100 then return format("%.0f %%/%s", v, unit) end
+    if v >= 10 then return format("%.1f %%/%s", v, unit) end
+    if v >= 0.01 then return format("%.2f %%/%s", v, unit) end
+    return format("%.2g %%/%s", v, unit)
 end
 
 local function plural(n, one, many) return format("%d %s", n, n == 1 and one or many) end
@@ -441,7 +543,7 @@ function M.CountLine(c, full)
     return line
 end
 
-M.COLUMN_LABEL = { name = "Item", price = "Price", upgrade = "Upgrade", value = "% per gold" }
+M.COLUMN_LABEL = { name = "Item", price = "Price", upgrade = "Upgrade", value = "Value" }
 
 function M.SortLabel(opts)
     return (M.COLUMN_LABEL[opts.sortColumn] or "?") .. (opts.sortDesc and " descending" or " ascending")

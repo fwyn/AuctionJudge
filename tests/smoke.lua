@@ -138,6 +138,7 @@ local function Client(opts)
     C.SECRET = setmetatable({}, { __tostring = function() return "<secret>" end })
     G.issecretvalue = function(v) return v == C.SECRET end
     G.GetTime = function() return C.clock end
+    G.date = function() return "2026-11-15 12:00:00" end
     G.print = function(...)
         local parts = {}
         for i = 1, select("#", ...) do parts[#parts + 1] = tostring((select(i, ...))) end
@@ -486,7 +487,7 @@ end
 local function click(w, button) w.scripts.OnClick(w, button or "LeftButton") end
 
 test("sorting by header clicks", function()
-    ok(headerByLabel("%% per gold").label.text:find(" v$"), "% per gold marked descending")
+    ok(headerByLabel("Value").label.text:find(" v$"), "Value marked descending")
     click(headerByLabel("Price"))
     eq(C.rowNames(), "Heavy Boots,Bandit's Cloak of the Bear,Lionheart Helm,Robe of Frost", "price ascending")
     ok(headerByLabel("Price").label.text:find(" %^$"), "price marked ascending")
@@ -496,7 +497,7 @@ test("sorting by header clicks", function()
     eq(C.rowNames(), "Robe of Frost,Lionheart Helm,Heavy Boots,Bandit's Cloak of the Bear", "upgrade descending")
     click(headerByLabel("Item"))
     eq(C.rowNames(), "Bandit's Cloak of the Bear,Heavy Boots,Lionheart Helm,Robe of Frost", "name ascending")
-    click(headerByLabel("%% per gold"))
+    click(headerByLabel("Value"))
     eq(G.AuctionJudgeDB.sortColumn .. tostring(G.AuctionJudgeDB.sortDesc), "valuetrue", "saved")
 end)
 
@@ -625,7 +626,7 @@ test("slash commands", function()
     ok(C.printedSince(n, "Auction house: open; last browse results 72 %(all loaded: no%)"), "browse line")
     ok(C.printedSince(n, "Rows: 69 %(gear 66, upgrades 64; scored 65, pending 0 of which resolving 0, unusable 1, "
         .. "error 0, not gear 3%)"), "rows line")
-    ok(C.printedSince(n, "sort %% per gold descending"), "panel line")
+    ok(C.printedSince(n, "sort Value descending"), "panel line")
     n = #C.printed
     C.slash("debug")
     ok(C.printedSince(n, "69 rows"), "debug header")
@@ -633,6 +634,16 @@ test("slash commands", function()
     ok(C.printedSince(n, "7%. 201:0 item:201 notgear %(EQUIP_LOC%)"), "not gear row with reason")
     local lines = #C.printed - n
     eq(lines, 16, "header and 15 rows")
+    n = #C.printed
+    C.slash("debug CLOAK")
+    ok(C.printedSince(n, "1 of 69 rows match \"CLOAK\":"), "debug lookup header")
+    ok(C.printedSince(n, "102:1200 Bandit's Cloak of the Bear: scored; upgrade 3, item 50 vs equipped 40 %(slot 5%); "
+        .. "price 20000, value 1.5; shown"), "debug lookup row")
+    ok(C.printedSince(n, "id 102 suffix 1200 ilvl 60, item:102::::::1200, INVTYPE_CLOAK, link |cff1eff00|Hitem:102"),
+        "debug lookup second line")
+    n = #C.printed
+    C.slash("debug item:201")
+    ok(C.printedSince(n, "201:0 %-: notgear %(EQUIP_LOC%).*hidden: not gear"), "hidden not-gear row (no name: found by item string)")
     n = #C.printed
     C.slash("")
     ok(C.printedSince(n, "/aj show | hide | toggle | status | debug"), "help")
@@ -659,7 +670,33 @@ test("auction house closes: loop stops, rows dropped; reopening reuses the panel
     local panelsBefore = 0
     for _, c in ipairs(G.AuctionHouseFrame.children) do if rawget(c, "template") == "BackdropTemplate" then panelsBefore = panelsBefore + 1 end end
     C.closeAH()
+    local d = G.AuctionJudgeDB.lastDump
+    ok(d, "dump written on close")
+    eq(d.why .. " " .. d.time, "closed 2026-11-15 12:00:00", "why and when")
+    eq(d.sgjReady and d.spec, "Retribution: Raid", "SGJ state")
+    eq(d.rawCount .. " " .. d.rowCount .. " " .. #d.rows, "72 69 69", "counts")
+    eq(d.full, false, "HasFullBrowseResults")
+    eq(d.filters.upgradesOnly, false, "filters")
+    eq(d.counts.scored, 65, "counts by state")
+    eq(d.rows[#d.rows].state, "notgear", "not-gear rows last")
+    local pet, merged = 0, 0
+    for _, s in ipairs(d.skipped) do
+        if s.reason == "battle pet" then pet = pet + 1 end
+        if s.reason:find("^merged into row 101:0") then merged = merged + 1 end
+    end
+    eq(pet .. " " .. merged, "1 2", "skipped: the pet and the two merged 101 entries")
+    local function plainOnly(t, path)
+        for k, v in pairs(t) do
+            local tv = type(v)
+            if v == C.SECRET then error(path .. "." .. k .. " is secret") end
+            if tv == "table" then plainOnly(v, path .. "." .. tostring(k))
+            elseif tv ~= "string" and tv ~= "number" and tv ~= "boolean" then error(path .. "." .. k .. " is " .. tv) end
+        end
+    end
+    plainOnly(d, "lastDump")
     eq(C.updaters(), 0, "no OnUpdate")
+    C.fire("PLAYER_LOGOUT")
+    eq(G.AuctionJudgeDB.lastDump, d, "no dump on logout while closed")
     eq(#C.ns.store.rows, 0, "rows dropped")
     eq(C.panel():IsVisible(), false, "panel hidden")
     local before = C.calls.GetBrowseResults
@@ -710,7 +747,7 @@ test("unreadable equip locations are unknown, not 'not gear'", function()
     S.load()
     S.fire("ADDON_LOADED", "AuctionJudge")
     S.openAH()
-    S.results = { result(401, 10000), result(402, 10000) }
+    S.results = { result(401, 10000), result(402, 5000) } -- the belt costs silver
     S.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
     S.advance(0.5)
     local store = S.ns.store
@@ -722,8 +759,15 @@ test("unreadable equip locations are unknown, not 'not gear'", function()
     secretItems[402].secretFull = false
     S.advance(3)
     eq(belt.state, "scored", "scored on a retry once readable")
-    eq(S.rowNames(), "Veiled Gloves,Masked Belt", "both listed")
+    -- belt: 2% at 50s = 4 %/g, shown per silver; gloves: 3% at 1g = 3 %/g
+    eq(S.rowNames(), "Masked Belt,Veiled Gloves", "both listed, by the true ratio")
+    eq(S.shownRows()[1].cells.value.text, "0.04 %/s", "per silver under 1 gold")
+    eq(S.shownRows()[2].cells.value.text, "3.00 %/g", "per gold")
+    S.fire("PLAYER_LOGOUT")
+    local d = S.G.AuctionJudgeDB.lastDump
+    eq(d.why .. " " .. #d.rows, "logout 2", "dump on logout with the auction house open")
     S.closeAH()
+    eq(S.G.AuctionJudgeDB.lastDump.why, "closed", "and again on close")
     local errs = S.errors()
     eq(#errs, 0, "errors: " .. table.concat(errs, " / "))
     local names = {}

@@ -104,7 +104,8 @@ local function markDirty()
 end
 
 local function readResults()
-    local entries, rawOrError = Game.BrowseResults() -- the raw count, or the error text when entries is nil
+    -- the raw count (or the error text when entries is nil) and the results left out by the reader
+    local entries, rawOrError, skipped = Game.BrowseResults()
     if not entries then
         lastReadError = rawOrError
         return
@@ -119,7 +120,7 @@ local function readResults()
         end
         e.equipLoc = loc
     end
-    M.Rebuild(store, entries)
+    M.Rebuild(store, entries, skipped)
     store.lastCount = raw
     store.full = Game.HasFullBrowseResults()
     markDirty()
@@ -258,7 +259,26 @@ function handlers.AUCTION_HOUSE_SHOW()
     markDirty()
 end
 
+---Saves what the auction house showed into AuctionJudgeDB.lastDump (plain values only). Built only when
+---the auction house closes or the player logs out with it open.
+local function writeDump(why)
+    if not ns.db then return end
+    local d = M.Dump(store, ns.db)
+    d.time = Game.DateText()
+    d.why = why
+    d.sgjLoaded = Game.SGJUsable()
+    d.sgjReady = Game.SGJReady()
+    d.spec = Game.SpecName()
+    d.lastReadError = lastReadError
+    ns.db.lastDump = d
+end
+
+function handlers.PLAYER_LOGOUT()
+    if open then safe("dump", writeDump, "logout") end
+end
+
 function handlers.AUCTION_HOUSE_CLOSED()
+    if open then safe("dump", writeDump, "closed") end
     open = false
     sleep()
     driver:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
@@ -288,6 +308,7 @@ driver:SetScript("OnEvent", function(_, event, ...)
 end)
 driver:RegisterEvent("ADDON_LOADED")
 driver:RegisterEvent("PLAYER_LOGIN")
+driver:RegisterEvent("PLAYER_LOGOUT")
 driver:RegisterEvent("AUCTION_HOUSE_SHOW")
 driver:RegisterEvent("AUCTION_HOUSE_CLOSED")
 driver:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
@@ -339,6 +360,17 @@ local function status()
         yesno(db.hideUnusable), M.SortLabel(db)))
 end
 
+---/aj debug <text>: every row whose name contains text, hidden ones included.
+local function debugFind(text)
+    local found = M.FindRows(store, text)
+    ns.Print(string.format("%d of %d rows match \"%s\":", #found, #store.rows, text))
+    for _, row in ipairs(found) do
+        local a, b = M.DebugLines(M.DumpRow(row, ns.db))
+        ns.Print(a)
+        ns.Print(b)
+    end
+end
+
 local function debug()
     local n = #store.rows
     ns.Print(string.format("%d rows (first 15, browse order):", n))
@@ -362,9 +394,10 @@ local function slash(msg)
     elseif cmd == "status" then
         status()
     elseif cmd == "debug" then
-        debug()
+        local text = (msg or ""):match("^%s*%S+%s+(.-)%s*$")
+        if text and text ~= "" then debugFind(text) else debug() end
     else
-        ns.Print("/aj show | hide | toggle | status | debug")
+        ns.Print("/aj show | hide | toggle | status | debug [name text]")
     end
 end
 

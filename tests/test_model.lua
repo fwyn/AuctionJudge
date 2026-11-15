@@ -372,7 +372,7 @@ test("view uses the saved sort; header clicks pick a natural direction, then rev
     eq(opts.sortColumn .. tostring(opts.sortDesc), "upgradetrue", "upgrade starts descending")
     M.ToggleSort(opts, "name")
     eq(opts.sortColumn .. tostring(opts.sortDesc), "namefalse", "name starts ascending")
-    eq(M.SortLabel({ sortColumn = "value", sortDesc = true }), "% per gold descending", "label")
+    eq(M.SortLabel({ sortColumn = "value", sortDesc = true }), "Value descending", "label")
 end)
 
 ---------------------------------------------------------------------------
@@ -405,6 +405,91 @@ test("upgrade and value formatting", function()
     eq(M.FormatValue(250), "250 %/g", "hundreds")
     eq(M.FormatValue(0.0012), "0.0012 %/g", "tiny")
     eq(M.FormatValue(nil), "", "no value")
+end)
+
+test("value is shown per silver under 1 gold, per gold from 1 gold; sorting uses the true ratio", function()
+    eq(M.FormatValue(M.Value(4.2, 50000), 50000), "0.84 %/g", "4.2% at 5g")
+    eq(M.FormatValue(M.Value(4.2, 500), 500), "0.84 %/s", "4.2% at 5s")
+    eq(M.FormatValue(M.Value(1, 10000), 10000), "1.00 %/g", "exactly 1g: per gold")
+    eq(M.FormatValue(M.Value(1, 9999), 9999), "0.01 %/s", "just under 1g: per silver")
+    local store = scoredStore({ { "Cheap", 500, "scored", 0.5 }, { "Dear", 20000, "scored", 4 } })
+    -- Cheap: 0.5% at 5s = 10 %/g (shown 0.10 %/s); Dear: 4% at 2g = 2 %/g (shown 2.00 %/g)
+    eq(names(M.Sort(M.Filter(store, {}), "value", true)), "Cheap,Dear", "order by the true ratio")
+    eq(M.FormatValue(store.rows[1].value, store.rows[1].price), "0.10 %/s", "cheap shown per silver")
+end)
+
+test("hidden reasons follow the filters", function()
+    local store = scoredStore(SPEC)
+    M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },
+        { itemID = 7 }, { itemID = 8 }, { itemID = 9, equipLoc = "" } })
+    local r = store.rows
+    local on = { upgradesOnly = true, hideUnusable = true }
+    local off = { upgradesOnly = false, hideUnusable = false }
+    eq(M.HiddenReason(r[1], on), nil, "upgrade shown")
+    eq(M.HiddenReason(r[4], on), "not an upgrade", "downgrade")
+    eq(M.HiddenReason(r[5], on), "not scored yet (upgrades only)", "pending")
+    eq(M.HiddenReason(r[6], on), "unusable", "unusable")
+    eq(M.HiddenReason(r[6], { hideUnusable = true }), "unusable", "unusable, all gear")
+    eq(M.HiddenReason(r[7], on), "scoring failed (upgrades only)", "error")
+    eq(M.HiddenReason(r[8], off), "item info not loaded", "unresolved")
+    eq(M.HiddenReason(r[9], off), "not gear", "not gear")
+    for i = 1, 7 do eq(M.HiddenReason(r[i], off), nil, "row " .. i .. " shown without filters") end
+end)
+
+test("dump: plain values, judged rows first, rows and skipped results capped", function()
+    local store = M.NewStore()
+    local entries = { { itemID = 9, equipLoc = "" }, { itemID = 1, itemSuffix = 7, itemLevel = 60, minPrice = 500 },
+        { itemID = 1, itemSuffix = 7, itemLevel = 62, minPrice = 900 }, { itemID = 0 } }
+    M.Rebuild(store, entries, { { itemID = 5, reason = "battle pet" } })
+    local row = store.byKey["1:7"]
+    M.ApplyInfo(store, row, info("Cloak", "INVTYPE_CLOAK"), 0)
+    M.ApplyScore(store, row, { upgradePct = -2, itemScore = 30, equippedScore = 31, slot = 15, specName = "S" }, nil, 0)
+    local d = M.Dump(store, { upgradesOnly = true, hideUnusable = true, sortColumn = "value", sortDesc = true })
+    eq(d.rawCount, 4, "raw count")
+    eq(d.rowCount, 2, "rows")
+    eq(d.rows[1].key, "1:7", "judged row first")
+    eq(d.rows[2].hiddenBy, "not gear", "not-gear row after")
+    local c = d.rows[1]
+    eq(c.itemSuffix .. " " .. c.itemLevel .. " " .. c.itemString, "7 60 item:1::::::7", "key parts")
+    eq(c.itemScore .. " " .. c.equippedScore .. " " .. c.slot .. " " .. c.upgradePct, "30 31 15 -2", "score parts")
+    eq(c.shown, false, "hidden")
+    eq(c.hiddenBy, "not an upgrade", "why")
+    eq(d.skippedCount, 3, "pet, merged variant, bad id")
+    eq(d.skipped[1].reason, "battle pet", "from the reader")
+    eq(d.skipped[2].reason, "merged into row 1:7 (lowest price kept)", "merged")
+    eq(d.skipped[2].itemLevel, 62, "merged entry item level")
+    eq(d.skipped[3].reason, "bad item id", "bad id")
+    eq(d.counts.notgear, 1, "counts")
+    local function plainOnly(t, path)
+        for k, v in pairs(t) do
+            local tv = type(v)
+            if tv == "table" then plainOnly(v, path .. "." .. tostring(k))
+            elseif tv ~= "string" and tv ~= "number" and tv ~= "boolean" then error(path .. "." .. k .. " is " .. tv) end
+        end
+    end
+    plainOnly(d, "dump")
+    ok(d.rows[1] ~= row, "a copy, not the row")
+
+    local big = M.NewStore()
+    local many = {}
+    for i = 1, 450 do many[i] = { itemID = i } end
+    for i = 1, 120 do many[#many + 1] = { itemID = 1 } end
+    M.Rebuild(big, many)
+    local bd = M.Dump(big, {})
+    eq(#bd.rows, M.MAX_DUMP_ROWS, "rows capped")
+    eq(#bd.skipped, M.MAX_SKIPPED, "skipped capped")
+    eq(bd.skippedCount, 120, "but all counted")
+end)
+
+test("debug lookup: by name, case-insensitive, hidden rows included", function()
+    local store = scoredStore(SPEC)
+    local found = M.FindRows(store, "ECHO")
+    eq(#found, 1, "one match")
+    local a, b = M.DebugLines(M.DumpRow(found[1], { upgradesOnly = true }))
+    ok(a:find("Echo: pending", 1, true) and a:find("hidden: not scored yet", 1, true), "state and why: " .. a)
+    ok(b:find("id 5 suffix 0", 1, true) and b:find("item:5", 1, true), "key parts: " .. b)
+    eq(#M.FindRows(store, "item:3"), 1, "item string matches too")
+    eq(#M.FindRows(store, "zulu"), 0, "no match")
 end)
 
 test("count line", function()

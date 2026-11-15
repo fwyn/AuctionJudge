@@ -198,7 +198,7 @@ local function fill(b, row)
     local up, key = M.FormatUpgrade(row)
     c.upgrade:SetText(up)
     color(c.upgrade, key)
-    c.value:SetText(M.FormatValue(row.value))
+    c.value:SetText(M.FormatValue(row.value, row.price))
     color(c.value, "normal")
     b:Show()
 end

@@ -25,23 +25,29 @@ Game.plain = plain
 -- Auction house
 ---------------------------------------------------------------------------
 
+local function num(v)
+    v = plain(v)
+    if type(v) == "number" then return v end
+    return nil
+end
+
+---A plain entry, or nil and why it was left out (with the item id and suffix when readable).
 local function readEntry(r)
-    if type(r) ~= "table" then return nil end
+    if type(r) ~= "table" then return nil, "not a table" end
     local key = r.itemKey
-    if type(key) ~= "table" then return nil end
-    local pet = plain(key.battlePetSpeciesID)
-    if type(pet) == "number" and pet ~= 0 then return nil end
-    local id = plain(key.itemID)
-    if type(id) ~= "number" then return nil end
-    local price, qty = plain(r.minPrice), plain(r.totalQuantity)
+    if type(key) ~= "table" then return nil, "no item key" end
+    local id, suffix = num(key.itemID), num(key.itemSuffix)
+    local pet = num(key.battlePetSpeciesID)
+    if pet and pet ~= 0 then return nil, "battle pet", id, suffix end
+    if not id then return nil, "item id unreadable", nil, suffix end
     return {
-        itemID = id, itemLevel = plain(key.itemLevel), itemSuffix = plain(key.itemSuffix),
-        minPrice = type(price) == "number" and price or nil, totalQuantity = type(qty) == "number" and qty or nil,
+        itemID = id, itemLevel = num(key.itemLevel), itemSuffix = suffix,
+        minPrice = num(r.minPrice), totalQuantity = num(r.totalQuantity),
     }
 end
 
----The current browse results as plain entries (pets and unreadable entries left out) and the raw result
----count, or nil and an error text.
+---The current browse results as plain entries, the raw result count, and the results left out (pets,
+---unreadable entries: { itemID, itemSuffix, reason }, at most 100); or nil and an error text.
 function Game.BrowseResults()
     local AH = C_AuctionHouse
     if type(AH) ~= "table" or type(AH.GetBrowseResults) ~= "function" then
@@ -49,17 +55,31 @@ function Game.BrowseResults()
     end
     local ok, results = pcall(AH.GetBrowseResults)
     if not ok then return nil, tostring(results) end
-    local out, n = {}, 0
-    if type(results) ~= "table" or isSecret(results) then return out, 0 end
+    local out, n, skipped = {}, 0, {}
+    if type(results) ~= "table" or isSecret(results) then return out, 0, skipped end
     local ok2, err = pcall(function()
         n = #results
         for i = 1, n do
-            local ok3, e = pcall(readEntry, results[i])
-            if ok3 and e then out[#out + 1] = e end
+            local ok3, e, why, id, suffix = pcall(readEntry, results[i])
+            if ok3 and e then
+                out[#out + 1] = e
+            elseif #skipped < 100 then
+                skipped[#skipped + 1] = { itemID = id, itemSuffix = suffix,
+                    reason = ok3 and why or ("read failed: " .. tostring(e)) }
+            end
         end
     end)
     if not ok2 then return nil, tostring(err) end
-    return out, n
+    return out, n, skipped
+end
+
+---Local date and time text, or nil.
+function Game.DateText()
+    local f = date
+    if type(f) ~= "function" then return nil end
+    local ok, text = pcall(f, "%Y-%m-%d %H:%M:%S")
+    if ok and type(text) == "string" then return text end
+    return nil
 end
 
 ---true / false, or nil when unknown.
