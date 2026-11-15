@@ -1,8 +1,11 @@
 ## Interface: 16001
 ## Title: AuctionJudge
-## Notes: Lists the gear in the current auction house results with Sharpie's Gear Judge upgrades and upgrade per gold.
-## Version: 0.1.0
-## OptionalDeps: SharpiesGearJudge
+## Notes: Judges the gear on the auction house for your character: upgrade and value per auction, using Sharpie's Gear Judge.
+## Author: Ferawyn
+## Version: 1.0.0
+## Dependencies: SharpiesGearJudge
+## X-Category: Auction & Economy
+## X-License: MIT
 ## SavedVariables: AuctionJudgeDB
 
 Model.lua
