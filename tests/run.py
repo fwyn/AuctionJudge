@@ -1,7 +1,7 @@
 """AuctionJudge tests under Lua 5.1 (lupa).
 
 1. Syntax check: every .lua in AuctionJudge/ must compile with Lua 5.1.
-2. Unit tests of the pure model (test_model.lua).
+2. Unit tests of the pure model and the item search queue (test_model.lua, test_queue.lua).
 3. Smoke test: the whole addon in a fake client (smoke.lua).
 
 Setup: py -3.13 -m venv tests\\.venv && tests\\.venv\\Scripts\\python.exe -m pip install lupa
@@ -15,7 +15,7 @@ from lupa import lua51
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ADDON = ROOT / "AuctionJudge"
 TESTS = ROOT / "tests"
-SUITES = ["test_model.lua", "smoke.lua"]
+SUITES = ["test_model.lua", "test_queue.lua", "smoke.lua"]
 
 
 def runtime():

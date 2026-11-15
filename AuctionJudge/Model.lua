@@ -62,12 +62,16 @@ end
 --   error     scoring failed, or still pending after MAX_TRIES
 -- store.pending counts pending rows and store.nextDue is no later than the earliest retry, so a batch
 -- costs nothing when there is no work.
+-- store.rows are the browse rows (a random suffix row is a group of auctions with varying stats);
+-- store.leaves are the rows judged and listed: each browse row, or in place of a group whose auctions
+-- were read, one row per distinct auction link (row.isAuction, row.group).
 
 local huge = math.huge
 
 function M.NewStore()
     return {
-        rows = {},      -- in browse order
+        rows = {},      -- browse rows, in browse order
+        leaves = {},    -- rows judged and listed
         byKey = {},     -- row key -> row
         byItem = {},    -- itemID -> list of rows
         info = {},      -- item string -> item info with a known equip location (session cache)
@@ -89,8 +93,17 @@ local function markDue(store, t)
 end
 
 local function recount(store)
+    local leaves = {}
+    for _, row in ipairs(store.rows) do
+        if row.auctions then
+            for _, a in ipairs(row.auctions) do leaves[#leaves + 1] = a end
+        else
+            leaves[#leaves + 1] = row
+        end
+    end
+    store.leaves = leaves
     local n = 0
-    for _, row in ipairs(store.rows) do if row.state == "pending" then n = n + 1 end end
+    for _, row in ipairs(leaves) do if row.state == "pending" then n = n + 1 end end
     store.pending = n
     store.nextDue = n > 0 and 0 or huge
 end
@@ -166,91 +179,35 @@ function M.LinkName(link)
     return nil
 end
 
----Row info from the base item info (GetItemInfo of the item string: equip location; for a random suffix
----item possibly only the base item's name and link), the item key info ({ name, quality, icon } or nil)
----and the link read from the item key (or nil) with its source. Without a key link a suffixed row is
----approximate: its score is the base item's.
-function M.MergeInfo(base, keyInfo, keyLink, keySource, suffix)
+---Row info for a browse row from the base item info (GetItemInfo of the item string: equip location and
+---link; for a random suffix group only the base item) and the item key info ({ name, quality, icon } or
+---nil: the group's suffixed name). A random suffix group is approximate: a browse row is a group of
+---auctions whose stats vary, and the item key has no exact link. Its base score stands in until the
+---group's auctions are read (SetAuctions).
+function M.MergeInfo(base, keyInfo, suffix)
     keyInfo = keyInfo or {}
-    local link = keyLink or base.link
     return {
-        name = keyInfo.name or M.LinkName(keyLink) or base.name,
-        link = link,
-        linkSource = keyLink and keySource or "iteminfo",
+        name = keyInfo.name or base.name,
+        link = base.link,
+        linkSource = "iteminfo",
         quality = keyInfo.quality or base.quality,
         icon = keyInfo.icon or base.icon,
         equipLoc = base.equipLoc,
-        approximate = (tonumber(suffix) or 0) ~= 0 and keyLink == nil,
+        approximate = (tonumber(suffix) or 0) ~= 0,
     }
 end
 
----Splits an item hyperlink "<prefix>|Hitem:<payload>|h[<name>]|h<tail>". Payload fields after "item:":
----1 itemID, 2 enchant, 3-6 gems, 7 suffix, 8 unique, 9 link level, 10 spec, 11 modifiers mask,
----12 item context, 13 number of bonus IDs, 14.. the bonus IDs, then the rest (kept as is).
----Returns { prefix, head (fields 1-12), bonus (list), rest (list), name, tail } or nil.
-function M.ParseLink(link)
-    if type(link) ~= "string" then return nil end
-    local prefix, payload, name, tail = link:match("^(.-)|Hitem:([^|]*)|h%[(.-)%]|h(.*)$")
-    if not payload then return nil end
-    local f = {}
-    for x in (payload .. ":"):gmatch("([^:]*):") do f[#f + 1] = x end
-    local head, bonus, rest = {}, {}, {}
-    for i = 1, 12 do head[i] = f[i] or "" end
-    local n = tonumber(f[13]) or 0
-    local i = 14
-    while #bonus < n and f[i] ~= nil do
-        bonus[#bonus + 1] = f[i]
-        i = i + 1
-    end
-    while f[i] ~= nil do
-        rest[#rest + 1] = f[i]
-        i = i + 1
-    end
-    return { prefix = prefix, head = head, bonus = bonus, rest = rest, name = name, tail = tail }
+---A browse row that needs its auctions read for exact scores: a scored random suffix group (stats vary
+---per auction) without auction rows and not queued yet. Unusable and non-gear groups never need it.
+function M.NeedsQuery(row)
+    return not row.isAuction and (row.suffix or 0) ~= 0 and row.info == true and row.auctions == nil
+        and row.query == nil and (row.state == "scored" or row.state == "error")
 end
 
-local function buildLink(p, head, bonus, name)
-    local f = {}
-    for i = 1, 12 do f[i] = head[i] end
-    f[13] = #bonus > 0 and tostring(#bonus) or ""
-    for _, b in ipairs(bonus) do f[#f + 1] = tostring(b) end
-    for _, r in ipairs(p.rest) do f[#f + 1] = r end
-    return p.prefix .. "|Hitem:" .. table.concat(f, ":") .. "|h[" .. name .. "]|h" .. p.tail
-end
-
----Candidate links for a random suffix, built from a base hyperlink, in the order to try:
----  suffixbonus   bonus list replaced by 1:<suffix>
----  suffixbonus+  existing bonus IDs kept, the suffix appended (left out when it equals the first)
----  suffixfield   the legacy form: suffix in field 7, no bonus IDs
----The display name becomes name (the item key's suffixed name). Returns a list of { source, link }.
-function M.SuffixCandidates(baseLink, suffix, name)
-    local p = M.ParseLink(baseLink)
-    if not p then return {} end
-    suffix = tostring(suffix)
-    name = name or p.name
-    local out, seen = {}, {}
-    local function add(source, link)
-        if seen[link] then return end
-        seen[link] = true
-        out[#out + 1] = { source = source, link = link }
-    end
-    add("suffixbonus", buildLink(p, p.head, { suffix }, name))
-    local more = {}
-    for _, b in ipairs(p.bonus) do more[#more + 1] = b end
-    more[#more + 1] = suffix
-    add("suffixbonus+", buildLink(p, p.head, more, name))
-    local legacy = {}
-    for i = 1, 12 do legacy[i] = p.head[i] end
-    legacy[7] = suffix
-    add("suffixfield", buildLink(p, legacy, {}, name))
-    return out
-end
-
----Rows per link source (keytooltip[+lvl], scan:displayed / scan:data / scan:getitem[+lvl], suffixbonus,
----suffixbonus+, suffixfield, iteminfo), resolved rows only.
+---Rows per link source ("iteminfo" for browse rows, "auction" for rows from a group's auctions).
 function M.LinkSourceCounts(store)
     local c = {}
-    for _, row in ipairs(store.rows) do
+    for _, row in ipairs(store.leaves) do
         if row.info then
             local s = row.linkSource or "iteminfo"
             c[s] = (c[s] or 0) + 1
@@ -274,7 +231,6 @@ function M.ApplyInfo(store, row, info, now)
     row.link = info.link or row.itemString
     row.linkSource = info.linkSource or "iteminfo"
     row.approximate = info.approximate == true
-    row.baseLink, row.candidates = info.baseLink, info.candidates
     row.sortName = type(info.name) == "string" and info.name:lower() or ""
     if not M.IsGear(info.equipLoc) then
         setState(store, row, "notgear")
@@ -347,6 +303,7 @@ function M.Rebuild(store, entries, skipped)
                     end
                 end
                 row.price, row.quantity, row.itemLevel = price, tonumber(e.totalQuantity), ilvl
+                row.itemKeyRef = e.itemKey -- the browse result's own item key, for an item search
                 byKey[key] = row
                 rows[#rows + 1] = row
                 local list = byItem[id]
@@ -376,10 +333,57 @@ function M.InfoArrived(store, itemID)
     return any
 end
 
+---A group's item search results arrived: results { link, buyout, bid, quantity } (plain values). The group
+---is listed as one row per distinct link (the lowest price kept; price is the buyout, else the bid, then
+---marked bid), each judged by its own link. Rows take item info from the group and cached scores.
+---Returns the number of auction rows.
+function M.SetAuctions(store, group, results)
+    local byLink, order = {}, {}
+    for _, r in ipairs(results) do
+        local link = r.link
+        local buyout, bid = tonumber(r.buyout), tonumber(r.bid)
+        if buyout == 0 then buyout = nil end
+        local price = buyout or bid
+        if type(link) == "string" and link:find("item:", 1, true) and price then
+            local a = byLink[link]
+            if not a then
+                order[#order + 1] = link
+                byLink[link] = { price = price, bid = buyout == nil, count = 1 }
+            else
+                a.count = a.count + 1
+                if price < a.price then a.price, a.bid = price, buyout == nil end
+            end
+        end
+    end
+    local old = {}
+    for _, a in ipairs(group.auctions or {}) do old[a.link] = a end
+    local rows = {}
+    for i, link in ipairs(order) do
+        local a = byLink[link]
+        local row = old[link]
+        if not row then
+            row = { key = group.key .. "#" .. i, itemID = group.itemID, suffix = group.suffix,
+                itemLevel = group.itemLevel, itemString = link, isAuction = true, group = group,
+                state = "pending", tries = 0, nextTry = 0 }
+            row.price = a.price
+            M.ApplyInfo(store, row, {
+                name = M.LinkName(link) or group.name, link = link, linkSource = "auction",
+                quality = group.quality, icon = group.icon, equipLoc = group.equipLoc,
+            })
+        end
+        row.price, row.bid, row.auctionCount = a.price, a.bid, a.count
+        if row.state == "scored" then row.value = M.Value(row.upgradePct, row.price) end
+        rows[#rows + 1] = row
+    end
+    group.auctions = rows
+    recount(store)
+    return #rows
+end
+
 ---SGJ's scores changed: forget every score and judge all gear rows again.
 function M.InvalidateScores(store)
     store.scores = {}
-    for _, row in ipairs(store.rows) do
+    for _, row in ipairs(store.leaves) do
         if row.info and M.IsGear(row.equipLoc) then resetScore(store, row) end
     end
 end
@@ -390,7 +394,7 @@ function M.NextBatch(store, now, limit)
     local batch = {}
     if store.pending <= 0 or now < store.nextDue then return batch end
     local nextDue = huge
-    for _, row in ipairs(store.rows) do
+    for _, row in ipairs(store.leaves) do
         if row.state == "pending" then
             local t = row.nextTry or 0
             if t <= now and #batch < limit then
@@ -405,10 +409,19 @@ function M.NextBatch(store, now, limit)
     return batch
 end
 
+---Query states of random suffix groups: done means resolved, failed or timed out.
+local QUERY_DONE = { resolved = true, failed = true, timeout = true }
+
 function M.Counts(store)
     local c = { total = #store.rows, gear = 0, upgrades = 0, pending = 0, scored = 0, unusable = 0, error = 0,
-        notgear = 0, resolving = 0 }
+        notgear = 0, resolving = 0, groups = 0, groupsDone = 0 }
     for _, row in ipairs(store.rows) do
+        if (row.suffix or 0) ~= 0 and row.info and row.state ~= "notgear" and row.state ~= "unusable" then
+            c.groups = c.groups + 1
+            if row.auctions or (row.query and QUERY_DONE[row.query.state]) then c.groupsDone = c.groupsDone + 1 end
+        end
+    end
+    for _, row in ipairs(store.leaves) do
         local s = row.state
         if s == "notgear" then
             c.notgear = c.notgear + 1
@@ -462,7 +475,7 @@ end
 ---Rows to list: resolved gear only, as the options allow.
 function M.Filter(store, opts)
     local out = {}
-    for _, row in ipairs(store.rows) do
+    for _, row in ipairs(store.leaves) do
         if not M.HiddenReason(row, opts) then out[#out + 1] = row end
     end
     return out
@@ -482,42 +495,58 @@ function M.DumpRow(row, opts)
         upgradePct = row.upgradePct, itemScore = row.itemScore, equippedScore = row.equippedScore, slot = row.slot,
         price = row.price, value = row.value, shown = hidden == nil, hiddenBy = hidden,
         linkSource = row.linkSource, approximate = row.approximate == true, sgjLink = row.sgjLink,
-        baseLink = row.baseLink, candidates = M.CopyCandidates(row.candidates),
+        auction = row.isAuction == true, group = row.group and row.group.key or nil, bid = row.bid == true,
+        auctionCount = row.auctionCount, query = M.QueryText(row),
     }
 end
 
----Suffix link candidates as plain values: { source, link, name (GetItemInfo), tooltipName, accepted }.
-function M.CopyCandidates(list)
-    if not list then return nil end
-    local out = {}
-    for i, c in ipairs(list) do
-        out[i] = { source = c.source, link = c.link, name = c.name, tooltipName = c.tooltipName,
-            accepted = c.accepted == true }
-    end
-    return out
+M.APPROXIMATE_NOTE = "base item score, exact auctions not read"
+
+---A group's item search state as text, e.g. "resolved, 1 attempt, 23 results, 9 rows", or nil.
+function M.QueryText(row)
+    local q = row.query
+    if not q then return nil end
+    local text = q.state .. ", " .. (q.attempts or 0) .. " attempt" .. ((q.attempts or 0) == 1 and "" or "s")
+    if q.results then text = text .. ", " .. q.results .. " results" end
+    if row.auctions then text = text .. ", " .. #row.auctions .. " rows" end
+    if q.reason then text = text .. " (" .. q.reason .. ")" end
+    return text
 end
 
-M.APPROXIMATE_NOTE = "base item score, suffix not resolved"
-
----Rows whose name (or item string) contains text, case-insensitive.
+---Listed rows (and groups whose auctions replaced them) whose name or item string contains text,
+---case-insensitive.
 function M.FindRows(store, text)
     local needle = text:lower()
     local out = {}
-    for _, row in ipairs(store.rows) do
+    local function check(row)
         local hay = (row.name or "") .. " " .. (row.itemString or "")
         if hay:lower():find(needle, 1, true) then out[#out + 1] = row end
+    end
+    for _, row in ipairs(store.rows) do
+        check(row)
+        for _, a in ipairs(row.auctions or {}) do check(a) end
     end
     return out
 end
 
----The diagnostic dump: settings, counts, rows (judged rows first, then not-gear rows, in browse order,
----up to MAX_DUMP_ROWS) and the browse results without a row of their own.
+---The diagnostic dump: settings, counts, the listed rows (judged rows first, then not-gear rows, up to
+---MAX_DUMP_ROWS), the random suffix groups with their item search state, and the browse results without
+---a row of their own.
 function M.Dump(store, opts)
     local rows = {}
     for pass = 1, 2 do
-        for _, row in ipairs(store.rows) do
+        for _, row in ipairs(store.leaves) do
             if #rows >= M.MAX_DUMP_ROWS then break end
             if (row.state == "notgear") == (pass == 2) then rows[#rows + 1] = M.DumpRow(row, opts) end
+        end
+    end
+    local groups = {}
+    for _, row in ipairs(store.rows) do
+        if (row.suffix or 0) ~= 0 and row.state ~= "notgear" and #groups < M.MAX_DUMP_ROWS then
+            local q = row.query or {}
+            groups[#groups + 1] = { key = row.key, name = row.name, price = row.price, state = row.state,
+                upgradePct = row.upgradePct, query = q.state or "none", attempts = q.attempts, results = q.results,
+                reason = q.reason, auctionRows = row.auctions and #row.auctions or nil }
         end
     end
     local skipped = {}
@@ -529,30 +558,31 @@ function M.Dump(store, opts)
         filters = { upgradesOnly = opts.upgradesOnly == true, hideUnusable = opts.hideUnusable == true,
             sortColumn = opts.sortColumn, sortDesc = opts.sortDesc == true },
         counts = M.Counts(store),
-        rawCount = store.lastCount, full = store.full, rowCount = #store.rows,
-        rows = rows, skipped = skipped, skippedCount = store.skippedCount or 0,
+        rawCount = store.lastCount, full = store.full, rowCount = #store.rows, leafCount = #store.leaves,
+        rows = rows, groups = groups, skipped = skipped, skippedCount = store.skippedCount or 0,
         linkSources = M.LinkSourceCounts(store),
     }
 end
 
 local function v(x) return x == nil and "-" or tostring(x) end
 
----Lines for /aj debug: two per row, plus one per suffix link candidate tried.
+---Two lines for /aj debug.
 function M.DebugLines(d)
-    local extra = {}
-    if d.baseLink then extra[#extra + 1] = "    suffix: base link " .. d.baseLink end
-    for _, c in ipairs(d.candidates or {}) do
-        extra[#extra + 1] = format("    try %s: item info %s, tooltip %s%s: %s", c.source, v(c.name), v(c.tooltipName),
-            c.accepted and " ACCEPTED" or "", c.link)
+    local where
+    if d.auction then
+        where = "; auction of group " .. d.group .. (d.auctionCount and d.auctionCount > 1 and
+            (" (" .. d.auctionCount .. " auctions with this link)") or "")
+    else
+        local resolved = d.query and d.query:find("^resolved")
+        where = (d.query and ("; item search " .. d.query .. (resolved and ", listed as its auction rows" or "")) or "")
+            .. ((d.approximate and not resolved) and ("; " .. M.APPROXIMATE_NOTE) or "")
     end
-    return format("%s %s: %s%s%s; upgrade %s, item %s vs equipped %s (slot %s); price %s, value %s; %s",
+    return format("%s %s: %s%s%s; upgrade %s, item %s vs equipped %s (slot %s); price %s%s, value %s; %s",
             d.key, v(d.name), d.state, d.reason and (" (" .. d.reason .. ")") or "",
             d.sgjReason and (" SGJ " .. d.sgjReason) or "", v(d.upgradePct), v(d.itemScore), v(d.equippedScore),
-            v(d.slot), v(d.price), v(d.value), d.shown and "shown" or ("hidden: " .. d.hiddenBy)),
+            v(d.slot), v(d.price), d.bid and " (bid)" or "", v(d.value), d.shown and "shown" or ("hidden: " .. d.hiddenBy)),
         format("    id %s suffix %s ilvl %s, %s, %s, link (%s) %s, SGJ judged %s%s", v(d.itemID), v(d.itemSuffix),
-            v(d.itemLevel), v(d.itemString), v(d.equipLoc), v(d.linkSource), v(d.link), v(d.sgjLink),
-            d.approximate and ("; " .. M.APPROXIMATE_NOTE) or ""),
-        extra
+            v(d.itemLevel), v(d.itemString), v(d.equipLoc), v(d.linkSource), v(d.link), v(d.sgjLink), where or "")
 end
 
 local RANK = { scored = 0, pending = 1, error = 2, unusable = 3 }
@@ -667,11 +697,15 @@ end
 
 local function plural(n, one, many) return format("%d %s", n, n == 1 and one or many) end
 
----"37 gear items, 9 upgrades, 4 pending".
-function M.CountLine(c, full)
+---"37 gear items, 9 upgrades, 4 pending", with ", resolving 5/23" while random suffix groups are still
+---waiting for their auctions (exact mode).
+function M.CountLine(c, full, exact)
     if c.total == 0 then return "No browse results yet: search the auction house." end
     local line = plural(c.gear, "gear item", "gear items") .. ", " .. plural(c.upgrades, "upgrade", "upgrades")
         .. ", " .. c.pending .. " pending"
+    if exact and (c.groups or 0) > 0 and c.groupsDone < c.groups then
+        line = line .. ", resolving " .. c.groupsDone .. "/" .. c.groups
+    end
     if full == false then line = line .. " (more results not loaded)" end
     return line
 end

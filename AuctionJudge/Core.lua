@@ -1,16 +1,22 @@
 -- Wiring: saved variables, events, the work loop while the auction house is open, slash commands.
--- AuctionJudge only reads what the current auction house search returned; it sends no queries.
+-- AuctionJudge reads the current browse results. For random suffix groups (auctions whose stats vary)
+-- it sends item searches through the queue (Queue.lua) to read the individual auctions' links. It never
+-- sends browse queries, and never buys, bids or posts.
 local ADDON, ns = ...
 
-local M, Game, Panel = ns.Model, ns.Game, ns.Panel
+local M, Q, Game, Panel = ns.Model, ns.Queue, ns.Game, ns.Panel
 
 local PREFIX = "|cff33ccffAuctionJudge|r: "
 local READ_DELAY = 0.2       -- debounce for browse result events
 local REFRESH_INTERVAL = 0.2 -- the list is rebuilt and sorted at most 5 times a second while work goes on
-local DEFAULTS = { shown = true, upgradesOnly = true, hideUnusable = true, sortColumn = "value", sortDesc = true }
+local KEY_WAITS = 2          -- tries a random suffix group waits for its item key info (its suffixed name)
+local DEFAULTS = { shown = true, upgradesOnly = true, hideUnusable = true, sortColumn = "value", sortDesc = true,
+    exact = true, maxQueries = 60 }
 
 local store = M.NewStore()
 ns.store = store
+local queue = Q.New()
+ns.queue = queue
 
 local open = false
 local readAt, nextBatchAt, nextRefreshAt, dirty = nil, 0, 0, false
@@ -18,6 +24,8 @@ local instant = {}       -- itemID -> equip location from GetItemInfoInstant (kn
 local sgjRegistered = false
 local lastReadError
 local specName
+local exactDisabled      -- why item searches are off for this session (missing or failing API)
+local lastWhy            -- why the queue did not send at its last turn
 
 function ns.Print(msg) print(PREFIX .. msg) end
 
@@ -48,7 +56,13 @@ local function initDB()
     local known = false
     for _, col in ipairs(M.COLUMNS) do if db.sortColumn == col then known = true end end
     if not known then db.sortColumn, db.sortDesc = DEFAULTS.sortColumn, DEFAULTS.sortDesc end
+    if type(db.maxQueries) ~= "number" or db.maxQueries < 0 then db.maxQueries = DEFAULTS.maxQueries end
     ns.db = db
+end
+
+---Item searches for random suffix groups are on: setting on, API working, SGJ there to judge.
+local function exactActive()
+    return ns.db ~= nil and ns.db.exact == true and not exactDisabled and Game.SGJUsable()
 end
 
 ---------------------------------------------------------------------------
@@ -64,6 +78,7 @@ local function buildView()
         spec = specName,
         counts = M.Counts(store),
         full = store.full,
+        exact = exactActive(),
         list = usable and M.View(store, db) or {},
         opts = db,
     }
@@ -103,6 +118,17 @@ local function markDirty()
     wake()
 end
 
+local function enqueue(row)
+    if exactActive() and M.NeedsQuery(row) then
+        Q.Enqueue(queue, row)
+        wake()
+    end
+end
+
+local function enqueueAll()
+    for _, row in ipairs(store.rows) do enqueue(row) end
+end
+
 local function readResults()
     -- the raw count (or the error text when entries is nil) and the results left out by the reader
     local entries, rawOrError, skipped = Game.BrowseResults()
@@ -123,36 +149,8 @@ local function readResults()
     M.Rebuild(store, entries, skipped)
     store.lastCount = raw
     store.full = Game.HasFullBrowseResults()
+    enqueueAll() -- groups already judged from the caches
     markDirty()
-end
-
-local KEY_WAITS = 2    -- tries a suffixed row waits for item key info (its suffixed name)
-local SUFFIX_TRIES = 3 -- tries a suffixed row waits for one of its candidate links to resolve
-
----The verified link of a random suffix row: the first candidate whose resolved name is the item key's
----suffixed name. Candidates: every link the client gives for the item key (key tooltip, scan tooltip),
----then links built from the first of them (or the item info link) with the suffix as a bonus ID or in
----field 7. Every candidate is resolved and recorded. Returns link, source; or nil when none verified.
-local function suffixLink(row, base, keyInfo)
-    local list = Game.KeyLinks(row.itemID, row.itemLevel, row.suffix)
-    local baseLink = list[1] and list[1].link or base.link
-    for _, c in ipairs(M.SuffixCandidates(baseLink, row.suffix, keyInfo.name)) do list[#list + 1] = c end
-    row.baseLink, row.candidates = baseLink, list
-    local resolved, accepted = {}, nil
-    for _, c in ipairs(list) do
-        local r = resolved[c.link]
-        if not r then
-            r = { Game.ResolveLinkName(c.link, base.name) }
-            resolved[c.link] = r
-        end
-        c.name, c.tooltipName = r[1], r[2]
-        if not accepted and (c.name == keyInfo.name or c.tooltipName == keyInfo.name) then
-            c.accepted = true
-            accepted = c
-        end
-    end
-    if accepted then return accepted.link, accepted.source end
-    return nil
 end
 
 local function work(row, now)
@@ -163,37 +161,25 @@ local function work(row, now)
             M.Defer(store, row, now, "ITEM_INFO")
             return
         end
-        -- The real name comes from the item key. GetItemInfo of a suffixed item string gives the base item,
-        -- and the key tooltip link is generic for the item id: the suffixed link has to be built and checked.
+        -- The group's name comes from the item key (GetItemInfo of a suffixed item string gives the base item).
         local keyInfo = Game.ItemKeyInfo(row.itemID, row.itemLevel, row.suffix)
-        local keyLink, source
-        if row.suffix == 0 then
-            keyLink, source = Game.KeyLink(row.itemID, row.itemLevel, row.suffix)
-        elseif M.IsGear(base.equipLoc) then
-            if not keyInfo and (row.keyWaits or 0) < KEY_WAITS then
-                row.keyWaits = (row.keyWaits or 0) + 1
-                M.Defer(store, row, now, "ITEM_KEY_INFO")
-                return
-            end
-            if keyInfo then
-                keyLink, source = suffixLink(row, base, keyInfo)
-                if not keyLink and (row.suffixTries or 0) < SUFFIX_TRIES then
-                    row.suffixTries = (row.suffixTries or 0) + 1
-                    M.Defer(store, row, now, "SUFFIX_LINK")
-                    return
-                end
-            else
-                keyLink, source = nil, nil -- no suffixed name to check against: judged as the base item
-            end
+        if not keyInfo and row.suffix ~= 0 and M.IsGear(base.equipLoc) and (row.keyWaits or 0) < KEY_WAITS then
+            row.keyWaits = (row.keyWaits or 0) + 1
+            M.Defer(store, row, now, "ITEM_KEY_INFO")
+            return
         end
-        local info = M.MergeInfo(base, keyInfo, keyLink, source, row.suffix)
-        info.baseLink, info.candidates = row.baseLink, row.candidates
-        M.ApplyInfo(store, row, info, now)
+        M.ApplyInfo(store, row, M.MergeInfo(base, keyInfo, row.suffix), now)
         -- not gear, a cached outcome, or an unknown equip location deferred for a retry
-        if row.state ~= "pending" or not row.info then return end
+        if row.state ~= "pending" or not row.info then
+            enqueue(row)
+            return
+        end
     end
+    -- auction rows carry their own auction link; browse rows the item info link
     local result, reason = Game.Score(row.link)
+    if reason == "NOT_CACHED" then Game.RequestItem(row.itemID) end
     M.ApplyScore(store, row, result, reason, now)
+    enqueue(row)
 end
 
 local function processBatch(now)
@@ -201,6 +187,26 @@ local function processBatch(now)
     local batch = M.NextBatch(store, now, M.BATCH_SIZE)
     for _, row in ipairs(batch) do work(row, now) end
     if #batch > 0 then markDirty() end
+end
+
+---One turn of the item search queue.
+local function runQueue(now)
+    if not exactActive() then return end
+    if Q.CheckTimeout(queue, now) then markDirty() end
+    local group, why = Q.Next(queue, now, Game.ThrottleReady(), ns.db.maxQueries)
+    lastWhy = why
+    if not group then return end
+    local ok, err = Game.SendSearch(group.itemKeyRef)
+    if ok then
+        Q.Sent(queue, group, now)
+    else
+        Q.SendFailed(queue, group, err)
+        if err ~= "no item key" then
+            exactDisabled = err
+            ns.Print("exact scores for random suffix items are off for this session: " .. err)
+        end
+    end
+    markDirty()
 end
 
 local function tick()
@@ -217,13 +223,16 @@ local function tick()
         nextBatchAt = now + M.BATCH_INTERVAL
         processBatch(now)
     end
+    runQueue(now)
     if dirty and now >= nextRefreshAt then
         dirty = false
         nextRefreshAt = now + REFRESH_INTERVAL
         refresh()
     end
-    -- idle: nothing to read, to work on or to draw
-    if not readAt and not dirty and Panel.Exists() and (store.pending <= 0 or not Game.SGJUsable()) then
+    -- idle: nothing to read, to work on, to search for or to draw
+    local working = store.pending > 0 and Game.SGJUsable()
+    local searching = exactActive() and Q.Waiting(queue, ns.db.maxQueries)
+    if not readAt and not dirty and Panel.Exists() and not working and not searching then
         sleep()
     end
 end
@@ -233,6 +242,27 @@ onUpdate = function() safe("update", tick) end
 local function scheduleRead()
     if not readAt then readAt = GetTime() + READ_DELAY end
     wake()
+end
+
+---Item search results for a key: only for a group we searched for (in flight, or resolved and getting
+---more results). The results are read for our own copy of the key.
+local function onItemSearchResults(itemKey)
+    local group = queue.inflight
+    if not (group and (itemKey == nil or Game.SameKey(group.itemKeyRef, itemKey))) then
+        group = nil
+        for _, row in ipairs(store.rows) do
+            if row.query and row.query.state == "resolved" and Game.SameKey(row.itemKeyRef, itemKey) then
+                group = row
+                break
+            end
+        end
+    end
+    if not group then return end
+    local results, total = Game.ItemSearchResults(group.itemKeyRef)
+    if not results or #results == 0 then return end -- not there yet: more events follow, or the timeout
+    M.SetAuctions(store, group, results)
+    Q.Resolved(queue, group, total)
+    markDirty()
 end
 
 ---------------------------------------------------------------------------
@@ -280,7 +310,8 @@ function ns.RowClicked(row)
         if not Game.InsertLink(link) then ns.Print(link) end
         return
     end
-    local name = Game.BaseName(row.itemID) or row.name
+    local group = row.group or row
+    local name = Game.BaseName(group.itemID) or group.name
     if not Game.Search(name) then ns.Print("could not search the auction house for " .. link) end
 end
 
@@ -289,6 +320,8 @@ end
 ---------------------------------------------------------------------------
 
 local handlers = {}
+local OPTIONAL_EVENTS = { "ITEM_KEY_ITEM_INFO_RECEIVED", "ITEM_SEARCH_RESULTS_UPDATED", "ITEM_SEARCH_RESULTS_ADDED",
+    "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" }
 
 function handlers.ADDON_LOADED(name)
     if name ~= ADDON then return end
@@ -305,13 +338,24 @@ function handlers.AUCTION_HOUSE_SHOW()
     open = true
     registerSGJ()
     driver:RegisterEvent("GET_ITEM_INFO_RECEIVED")
-    pcall(driver.RegisterEvent, driver, "ITEM_KEY_ITEM_INFO_RECEIVED") -- may not exist on this client
+    for _, e in ipairs(OPTIONAL_EVENTS) do pcall(driver.RegisterEvent, driver, e) end -- may not exist here
     specName = Game.SGJReady() and Game.SpecName() or nil
     if Panel.Ensure() then Panel.SetVisible(ns.db.shown) end
     Panel.ResetScroll()
     nextBatchAt, nextRefreshAt = 0, 0
     scheduleRead()
     markDirty()
+end
+
+local function exactState()
+    local api = Game.SearchAPI()
+    local found = {}
+    for _, name in ipairs(Game.SEARCH_FUNCTIONS) do found[#found + 1] = name .. (api[name] and " ok" or " MISSING") end
+    return {
+        setting = ns.db.exact == true, active = exactActive(), disabled = exactDisabled, maxQueries = ns.db.maxQueries,
+        api = table.concat(found, ", "), sort = api.sort or "none", queued = Q.Length(queue), sent = queue.sent,
+        failures = queue.failures, inflight = queue.inflight and queue.inflight.key or nil, waiting = lastWhy,
+    }
 end
 
 ---Saves what the auction house showed into AuctionJudgeDB.lastDump (plain values only). Built only when
@@ -325,13 +369,15 @@ local function writeDump(why)
     d.sgjReady = Game.SGJReady()
     d.spec = Game.SpecName()
     d.lastReadError = lastReadError
-    -- the first suffixed row's tooltip text, key tooltip vs the judged link, to compare stats by eye
+    d.exact = exactState()
+    -- the first random suffix group's tooltip text next to its first auction's, to compare stats by eye
     for _, row in ipairs(store.rows) do
         if row.suffix ~= 0 and row.info and row.state ~= "notgear" then
+            local first = row.auctions and row.auctions[1]
             d.suffixSample = {
-                key = row.key, name = row.name, link = row.link, linkSource = row.linkSource,
+                key = row.key, name = row.name, auctionLink = first and first.link or nil,
                 keyTooltipLines = Game.KeyTooltipLines(row.itemID, row.itemLevel, row.suffix, 12),
-                linkTooltipLines = Game.LinkTooltipLines(row.link, 12),
+                linkTooltipLines = first and Game.LinkTooltipLines(first.link, 12) or nil,
             }
             break
         end
@@ -348,20 +394,25 @@ function handlers.AUCTION_HOUSE_CLOSED()
     open = false
     sleep()
     driver:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
-    pcall(driver.UnregisterEvent, driver, "ITEM_KEY_ITEM_INFO_RECEIVED")
+    for _, e in ipairs(OPTIONAL_EVENTS) do pcall(driver.UnregisterEvent, driver, e) end
     readAt, dirty = nil, false
+    Q.Cancel(queue)
     M.Clear(store)
     Panel.SetVisible(false)
 end
 
 function handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
     if not open then return end
+    -- a new search: its groups are queued afresh after the read
+    Q.Cancel(queue)
+    Q.Hold(queue, GetTime())
     Panel.ResetScroll()
     scheduleRead()
 end
 
 function handlers.AUCTION_HOUSE_BROWSE_RESULTS_ADDED()
     if not open then return end
+    Q.Hold(queue, GetTime())
     scheduleRead()
 end
 
@@ -369,6 +420,15 @@ function handlers.GET_ITEM_INFO_RECEIVED(itemID)
     if open and M.InfoArrived(store, itemID) then wake() end
 end
 handlers.ITEM_KEY_ITEM_INFO_RECEIVED = handlers.GET_ITEM_INFO_RECEIVED
+
+function handlers.ITEM_SEARCH_RESULTS_UPDATED(itemKey)
+    if open then onItemSearchResults(itemKey) end
+end
+handlers.ITEM_SEARCH_RESULTS_ADDED = handlers.ITEM_SEARCH_RESULTS_UPDATED
+
+function handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY()
+    wake()
+end
 
 driver:SetScript("OnEvent", function(_, event, ...)
     local fn = handlers[event]
@@ -419,37 +479,30 @@ local function status()
     local c = M.Counts(store)
     local cached = 0
     for _ in pairs(store.scores) do cached = cached + 1 end
-    ns.Print(string.format("Rows: %d (gear %d, upgrades %d; scored %d, pending %d of which resolving %d, unusable %d, "
-        .. "error %d, not gear %d); %d scores cached", c.total, c.gear, c.upgrades, c.scored, c.pending, c.resolving,
-        c.unusable, c.error, c.notgear, cached))
-    local sources = M.LinkSourceCounts(store)
-    local approx = 0
-    for _, row in ipairs(store.rows) do if row.approximate then approx = approx + 1 end end
-    local parts = {}
-    local names = {}
-    for name in pairs(sources) do names[#names + 1] = name end
-    table.sort(names)
-    for _, name in ipairs(names) do parts[#parts + 1] = name .. " " .. sources[name] end
-    if #parts == 0 then parts[1] = "none yet" end
-    local TI = C_TooltipInfo
-    ns.Print(string.format("Links: %s; %d suffixed rows judged as the base item (*); C_TooltipInfo.GetItemKey %s, "
-        .. "GetHyperlink %s", table.concat(parts, ", "), approx, yesno(type(TI) == "table" and TI.GetItemKey),
-        yesno(type(TI) == "table" and TI.GetHyperlink)))
+    ns.Print(string.format("Rows: %d listed from %d browse rows (gear %d, upgrades %d; scored %d, pending %d of which "
+        .. "resolving %d, unusable %d, error %d, not gear %d); %d scores cached", #store.leaves, c.total, c.gear,
+        c.upgrades, c.scored, c.pending, c.resolving, c.unusable, c.error, c.notgear, cached))
+    local x = exactState()
+    ns.Print(string.format("Exact scores: %s%s; random suffix groups %d, done %d; queue %d queued, %d sent this search "
+        .. "(max %d), %d failed%s%s", x.active and "on" or (x.setting and "on but inactive" or "off"),
+        x.disabled and (" (disabled: " .. x.disabled .. ")") or "", c.groups, c.groupsDone, x.queued, x.sent,
+        x.maxQueries, x.failures, x.inflight and ("; in flight " .. x.inflight) or "",
+        x.waiting and ("; waiting: " .. x.waiting) or ""))
+    ns.Print("Item search API: " .. x.api .. "; sort " .. x.sort)
     local db = ns.db
     ns.Print(string.format("Panel: %s, %s; upgrades only %s, hide unusable %s, sort %s",
         Panel.Exists() and "created" or "not created", db.shown and "on" or "off", yesno(db.upgradesOnly),
         yesno(db.hideUnusable), M.SortLabel(db)))
 end
 
----/aj debug <text>: every row whose name contains text, hidden ones included.
+---/aj debug <text>: every row whose name contains text, hidden ones and replaced groups included.
 local function debugFind(text)
     local found = M.FindRows(store, text)
-    ns.Print(string.format("%d of %d rows match \"%s\":", #found, #store.rows, text))
+    ns.Print(string.format("Rows matching \"%s\": %d", text, #found))
     for _, row in ipairs(found) do
-        local a, b, extra = M.DebugLines(M.DumpRow(row, ns.db))
+        local a, b = M.DebugLines(M.DumpRow(row, ns.db))
         ns.Print(a)
         ns.Print(b)
-        for _, line in ipairs(extra) do ns.Print(line) end
     end
 end
 
@@ -465,7 +518,8 @@ local function debug()
 end
 
 local function slash(msg)
-    local cmd = (msg or ""):match("^%s*(%S*)"):lower()
+    local cmd, arg = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
+    cmd = cmd:lower()
     if cmd == "show" then
         ns.SetShown(true)
         if not open then ns.Print("the panel will show at the auction house") end
@@ -476,10 +530,19 @@ local function slash(msg)
     elseif cmd == "status" then
         status()
     elseif cmd == "debug" then
-        local text = (msg or ""):match("^%s*%S+%s+(.-)%s*$")
-        if text and text ~= "" then debugFind(text) else debug() end
+        if arg ~= "" then debugFind(arg) else debug() end
+    elseif cmd == "exact" and (arg == "on" or arg == "off") then
+        ns.db.exact = arg == "on"
+        if ns.db.exact then enqueueAll() else Q.Cancel(queue) end
+        ns.Print("exact scores for random suffix items " .. arg .. (exactDisabled and (" (disabled this session: "
+            .. exactDisabled .. ")") or ""))
+        markDirty()
+    elseif cmd == "maxqueries" and tonumber(arg) then
+        ns.db.maxQueries = math.max(0, math.floor(tonumber(arg)))
+        ns.Print("at most " .. ns.db.maxQueries .. " item searches per auction house search")
+        wake()
     else
-        ns.Print("/aj show | hide | toggle | status | debug [name text]")
+        ns.Print("/aj show | hide | toggle | status | debug [name text] | exact on|off | maxqueries <n>")
     end
 end
 

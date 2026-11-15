@@ -6,6 +6,7 @@
 ## SavedVariables: AuctionJudgeDB
 
 Model.lua
+Queue.lua
 Game.lua
 Panel.lua
 Core.lua

@@ -43,6 +43,7 @@ local function readEntry(r)
     return {
         itemID = id, itemLevel = num(key.itemLevel), itemSuffix = suffix,
         minPrice = num(r.minPrice), totalQuantity = num(r.totalQuantity),
+        itemKey = key, -- the game's own table, passed back unchanged to an item search
     }
 end
 
@@ -145,7 +146,8 @@ function Game.ItemInfo(itemString)
 end
 
 ---------------------------------------------------------------------------
--- Item keys: the real (random suffix) name and link, the way the Blizzard list gets them. No queries.
+-- Item keys and item searches. A browse row is a group of auctions; for a random suffix group the key
+-- has no exact link (its stats vary per auction), so exact links come from an item search for the key.
 ---------------------------------------------------------------------------
 
 local function makeItemKey(itemID, itemLevel, itemSuffix)
@@ -157,8 +159,8 @@ local function makeItemKey(itemID, itemLevel, itemSuffix)
     return { itemID = itemID, itemLevel = itemLevel or 0, itemSuffix = itemSuffix or 0, battlePetSpeciesID = 0 }
 end
 
----{ name, quality, icon } from C_AuctionHouse.GetItemKeyInfo, or nil until the client has it
----(ITEM_KEY_ITEM_INFO_RECEIVED follows).
+---{ name, quality, icon } from C_AuctionHouse.GetItemKeyInfo (the group's suffixed name), or nil until
+---the client has it (ITEM_KEY_ITEM_INFO_RECEIVED follows).
 function Game.ItemKeyInfo(itemID, itemLevel, itemSuffix)
     local AH = C_AuctionHouse
     if type(AH) ~= "table" or type(AH.GetItemKeyInfo) ~= "function" then return nil end
@@ -176,112 +178,99 @@ function Game.ItemKeyInfo(itemID, itemLevel, itemSuffix)
     return out
 end
 
----A readable link string for this item id, or nil.
-local function checkLink(link, itemID)
-    link = plain(link)
-    if type(link) ~= "string" then return nil end
-    local id = link:match("item:(%-?%d+)")
-    if not id or tonumber(id) ~= itemID then return nil end
-    return link
-end
+Game.SEARCH_FUNCTIONS = { "SendSearchQuery", "GetNumItemSearchResults", "GetItemSearchResultInfo",
+    "HasFullItemSearchResults", "IsThrottledMessageSystemReady" }
 
-local scanTip -- false once creating it failed
-local function scanTooltip()
-    if scanTip == nil then
-        local ok, tip = pcall(CreateFrame, "GameTooltip", "AuctionJudgeScanTooltip", nil, "GameTooltipTemplate")
-        scanTip = ok and tip or false
-    end
-    return scanTip or nil
-end
-
----The required level the auction house knows for an item key (the 4th SetItemKey argument), or nil.
-function Game.RequiredLevel(itemID, itemLevel, itemSuffix)
+---Which item search functions exist, and the sort order used: { name = true/false, sort = "Buyout" ... }.
+function Game.SearchAPI()
     local AH = C_AuctionHouse
-    if type(AH) ~= "table" or type(AH.GetItemKeyRequiredLevel) ~= "function" then return nil end
-    local ok, level = pcall(AH.GetItemKeyRequiredLevel, makeItemKey(itemID, itemLevel, itemSuffix))
-    level = ok and plain(level)
-    if type(level) == "number" then return level end
-    return nil
-end
-
----The key tooltip data from C_TooltipInfo.GetItemKey, or nil.
-local function keyTooltipData(itemID, itemLevel, itemSuffix, reqLevel)
-    local TI = C_TooltipInfo
-    if type(TI) ~= "table" or type(TI.GetItemKey) ~= "function" then return nil end
-    local ok, data
-    if reqLevel then
-        ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix, reqLevel)
-    else
-        ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix)
-    end
-    if ok and type(data) == "table" and not isSecret(data) then return data end
-    return nil
-end
-
----Sets the hidden scan tooltip to the item key and reads its link the three ways SGJ reads a shown
----tooltip: TooltipUtil.GetDisplayedItem, processingInfo.tooltipData.hyperlink, GetItem.
-local function scanItemKey(itemID, itemLevel, itemSuffix, reqLevel, tag, out)
-    local tip = scanTooltip()
-    if not tip then return end
-    local ok = pcall(function()
-        tip:SetOwner(WorldFrame or UIParent, "ANCHOR_NONE")
-        tip:ClearLines()
-        if reqLevel then
-            tip:SetItemKey(itemID, itemLevel, itemSuffix, reqLevel)
-        else
-            tip:SetItemKey(itemID, itemLevel, itemSuffix)
-        end
-    end)
-    if ok then
-        local TU = TooltipUtil
-        if type(TU) == "table" and type(TU.GetDisplayedItem) == "function" then
-            local ok2, _, link = pcall(TU.GetDisplayedItem, tip)
-            link = ok2 and checkLink(link, itemID)
-            if link then out[#out + 1] = { source = "scan:displayed" .. tag, link = link } end
-        end
-        local ok3, link3 = pcall(function()
-            local info = tip.processingInfo
-            local data = type(info) == "table" and info.tooltipData
-            return type(data) == "table" and checkLink(data.hyperlink, itemID) or nil
-        end)
-        if ok3 and link3 then out[#out + 1] = { source = "scan:data" .. tag, link = link3 } end
-        local ok4, _, link4 = pcall(function() return tip:GetItem() end)
-        link4 = ok4 and checkLink(link4, itemID)
-        if link4 then out[#out + 1] = { source = "scan:getitem" .. tag, link = link4 } end
-    end
-    pcall(function() tip:Hide() end)
-end
-
----Links the client gives for an item key, in the order to try: { source, link }. Sources: keytooltip,
----keytooltip+lvl (with the required level), scan:displayed, scan:data, scan:getitem (and +lvl). With
----first = true only the first one is looked for (rows without a random suffix).
-function Game.KeyLinks(itemID, itemLevel, itemSuffix, first)
-    itemLevel, itemSuffix = itemLevel or 0, itemSuffix or 0
     local out = {}
-    local data = keyTooltipData(itemID, itemLevel, itemSuffix)
-    if data then
-        local ok, link = pcall(function() return checkLink(data.hyperlink, itemID) end)
-        if ok and link then out[#out + 1] = { source = "keytooltip", link = link } end
+    for _, name in ipairs(Game.SEARCH_FUNCTIONS) do
+        out[name] = type(AH) == "table" and type(AH[name]) == "function"
     end
-    if first and out[1] then return out end
-    local reqLevel = not first and Game.RequiredLevel(itemID, itemLevel, itemSuffix) or nil
-    if reqLevel then
-        local data2 = keyTooltipData(itemID, itemLevel, itemSuffix, reqLevel)
-        if data2 then
-            local ok, link = pcall(function() return checkLink(data2.hyperlink, itemID) end)
-            if ok and link then out[#out + 1] = { source = "keytooltip+lvl", link = link } end
-        end
+    local E = type(Enum) == "table" and Enum.AuctionHouseSortOrder
+    if type(E) == "table" then
+        if E.Buyout ~= nil then out.sort = "Buyout" elseif E.Price ~= nil then out.sort = "Price" end
     end
-    scanItemKey(itemID, itemLevel, itemSuffix, nil, "", out)
-    if first then return out end
-    if reqLevel then scanItemKey(itemID, itemLevel, itemSuffix, reqLevel, "+lvl", out) end
     return out
 end
 
----The first link the client gives for an item key and its source, or nil.
-function Game.KeyLink(itemID, itemLevel, itemSuffix)
-    local c = Game.KeyLinks(itemID, itemLevel, itemSuffix, true)[1]
-    if c then return c.link, c.source end
+---true when the auction house accepts a query now (true when the client has no such check).
+function Game.ThrottleReady()
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.IsThrottledMessageSystemReady) ~= "function" then return true end
+    local ok, ready = pcall(AH.IsThrottledMessageSystemReady)
+    return ok and plain(ready) == true
+end
+
+---Sends an item search for the browse result's own item key, cheapest first. true, or false and why.
+function Game.SendSearch(itemKey)
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.SendSearchQuery) ~= "function" then return false, "SendSearchQuery missing" end
+    if type(itemKey) ~= "table" then return false, "no item key" end
+    local sorts = {}
+    local E = type(Enum) == "table" and Enum.AuctionHouseSortOrder
+    local order = type(E) == "table" and (E.Buyout or E.Price)
+    if order ~= nil then sorts[1] = { sortOrder = order, reverseSort = false } end
+    local ok, err = pcall(AH.SendSearchQuery, itemKey, sorts, false)
+    if not ok then return false, "SendSearchQuery error: " .. tostring(err) end
+    return true
+end
+
+local function keyField(key, name)
+    local v = plain(key[name])
+    return type(v) == "number" and v or 0
+end
+
+---true when two item keys name the same group (item id, item level, suffix).
+function Game.SameKey(a, b)
+    if type(a) ~= "table" or type(b) ~= "table" then return false end
+    local ok, same = pcall(function()
+        return keyField(a, "itemID") == keyField(b, "itemID") and keyField(a, "itemLevel") == keyField(b, "itemLevel")
+            and keyField(a, "itemSuffix") == keyField(b, "itemSuffix")
+    end)
+    return ok and same
+end
+
+---The item search results for a key as plain values { link, buyout, bid, quantity } (at most 200), the
+---number of results and whether they are complete; or nil and why.
+function Game.ItemSearchResults(itemKey)
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.GetNumItemSearchResults) ~= "function"
+        or type(AH.GetItemSearchResultInfo) ~= "function" then
+        return nil, "item search result functions missing"
+    end
+    local ok, n = pcall(AH.GetNumItemSearchResults, itemKey)
+    n = ok and plain(n)
+    if type(n) ~= "number" then return nil, "no result count" end
+    local out = {}
+    for i = 1, math.min(n, 200) do
+        local ok2, info = pcall(AH.GetItemSearchResultInfo, itemKey, i)
+        if ok2 and type(info) == "table" and not isSecret(info) then
+            local ok3, r = pcall(function()
+                local link = plain(info.itemLink)
+                local buyout, bid, qty = plain(info.buyoutAmount), plain(info.bidAmount), plain(info.quantity)
+                return { link = type(link) == "string" and link or nil,
+                    buyout = type(buyout) == "number" and buyout or nil, bid = type(bid) == "number" and bid or nil,
+                    quantity = type(qty) == "number" and qty or nil }
+            end)
+            if ok3 and r.link then out[#out + 1] = r end
+        end
+    end
+    local full
+    if type(AH.HasFullItemSearchResults) == "function" then
+        local ok4, f = pcall(AH.HasFullItemSearchResults, itemKey)
+        full = ok4 and plain(f)
+    end
+    return out, n, full
+end
+
+---The key tooltip data from C_TooltipInfo.GetItemKey, or nil.
+local function keyTooltipData(itemID, itemLevel, itemSuffix)
+    local TI = C_TooltipInfo
+    if type(TI) ~= "table" or type(TI.GetItemKey) ~= "function" then return nil end
+    local ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix)
+    if ok and type(data) == "table" and not isSecret(data) then return data end
     return nil
 end
 
@@ -310,27 +299,6 @@ function Game.LinkTooltipLines(link, max)
     local ok, lines = pcall(function() return textLines(TI.GetHyperlink(link), max) end)
     return ok and lines or {}
 end
-
----The names a link resolves to without any query: GetItemInfo's name, and when that is missing or the
----base name, the first tooltip line from C_TooltipInfo.GetHyperlink. Either may be nil.
-function Game.ResolveLinkName(link, baseName)
-    local info = Game.ItemInfo(link)
-    local itemName = info and info.name
-    local tipName
-    if not itemName or itemName == baseName then
-        local TI = C_TooltipInfo
-        if type(TI) == "table" and type(TI.GetHyperlink) == "function" then
-            local ok, name = pcall(function()
-                local data = TI.GetHyperlink(link)
-                local line = type(data) == "table" and not isSecret(data) and type(data.lines) == "table" and data.lines[1]
-                return type(line) == "table" and plain(line.leftText) or nil
-            end)
-            if ok and type(name) == "string" and name ~= "" then tipName = name end
-        end
-    end
-    return itemName, tipName
-end
-
 ---The item's base name (without a random suffix), for searching.
 function Game.BaseName(itemID)
     local f = C_Item and C_Item.GetItemNameByID

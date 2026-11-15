@@ -195,7 +195,7 @@ local function fill(b, row)
     local c = b.cells
     c.name:SetText(row.name or row.itemString)
     c.name:SetTextColor(q[1], q[2], q[3])
-    c.price:SetText(Game.CoinText(row.price))
+    c.price:SetText(Game.CoinText(row.price) .. (row.bid and " bid" or ""))
     local up, key = M.FormatUpgrade(row)
     c.upgrade:SetText(up)
     color(c.upgrade, key)
@@ -223,9 +223,9 @@ function Panel.Refresh(view)
         countLine:SetText("Sharpie's Gear Judge is not loaded: nothing to judge.")
         list = {}
     elseif not view.ready then
-        countLine:SetText("Waiting for Sharpie's Gear Judge to finish loading. " .. M.CountLine(view.counts, view.full))
+        countLine:SetText("Waiting for Sharpie's Gear Judge to finish loading. " .. M.CountLine(view.counts, view.full, view.exact))
     else
-        countLine:SetText(M.CountLine(view.counts, view.full))
+        countLine:SetText(M.CountLine(view.counts, view.full, view.exact))
     end
 
     local total = #list

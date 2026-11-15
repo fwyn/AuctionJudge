@@ -492,73 +492,89 @@ test("debug lookup: by name, case-insensitive, hidden rows included", function()
     eq(#M.FindRows(store, "zulu"), 0, "no match")
 end)
 
-test("random suffix info: key name and link win, base link only is approximate", function()
+test("random suffix groups: key name, base link, approximate; which rows need an item search", function()
     local base = { name = "Cadet Vest", link = "|cff1eff00|Hitem:501|h[Cadet Vest]|h|r", quality = 2, icon = 1,
         equipLoc = "INVTYPE_CHEST" }
-    local keyLink = "|cff1eff00|Hitem:501::::::1002|h[Cadet Vest of the Whale]|h|r"
-    local i1 = M.MergeInfo(base, { name = "Cadet Vest of the Whale", quality = 3, icon = 7 }, keyLink, "keytooltip", 1002)
-    eq(i1.name .. "|" .. i1.link .. "|" .. i1.linkSource, "Cadet Vest of the Whale|" .. keyLink .. "|keytooltip", "key")
-    eq(i1.quality .. " " .. i1.icon .. " " .. i1.equipLoc, "3 7 INVTYPE_CHEST", "key info, base equip location")
-    eq(i1.approximate, false, "exact")
-    local i2 = M.MergeInfo(base, nil, keyLink, "scantooltip", 1002)
-    eq(i2.name, "Cadet Vest of the Whale", "name from the link without key info")
-    local i3 = M.MergeInfo(base, { name = "Cadet Vest of the Whale" }, nil, nil, 1002)
-    eq(i3.link .. " " .. i3.linkSource, base.link .. " iteminfo", "fallback link")
-    eq(i3.approximate, true, "suffixed row on the base link: approximate")
-    eq(i3.name, "Cadet Vest of the Whale", "but the key name")
-    eq(M.MergeInfo(base, nil, nil, nil, 0).approximate, false, "no suffix: the base link is exact")
-    eq(M.LinkName(keyLink), "Cadet Vest of the Whale", "link name")
+    local g = M.MergeInfo(base, { name = "Cadet Vest of the Whale", quality = 3, icon = 7 }, 14301)
+    eq(g.name .. "|" .. g.link .. "|" .. g.linkSource, "Cadet Vest of the Whale|" .. base.link .. "|iteminfo", "group info")
+    eq(g.quality .. " " .. g.icon .. " " .. g.equipLoc .. " " .. tostring(g.approximate), "3 7 INVTYPE_CHEST true", "parts")
+    local f = M.MergeInfo(base, nil, 0)
+    eq(f.name .. " " .. tostring(f.approximate), "Cadet Vest false", "fixed-stat item: exact")
+    eq(M.LinkName("|cnIQ2:|Hitem:501::::::::15:1486:::1:12725::::::|h[Cadet Vest of Healing]|h|r"), "Cadet Vest of Healing",
+        "link name")
     eq(M.LinkName("item:5"), nil, "no name in an item string")
 
     local store = M.NewStore()
-    M.Rebuild(store, { { itemID = 501, itemSuffix = 1002 }, { itemID = 501, itemSuffix = 1001 } })
-    M.ApplyInfo(store, store.rows[1], i3, 0)
-    M.ApplyInfo(store, store.rows[2], i1, 0)
-    eq(store.info["item:501::::::1002"], nil, "approximate info not cached")
-    ok(store.info["item:501::::::1001"], "exact info cached")
-    M.ApplyScore(store, store.rows[1], { upgradePct = 2.5, itemLink = base.link }, nil, 0)
-    eq((M.FormatUpgrade(store.rows[1])), "+2.5%*", "marked")
-    M.ApplyScore(store, store.rows[2], { upgradePct = 4 }, nil, 0)
-    eq((M.FormatUpgrade(store.rows[2])), "+4.0%", "not marked")
-    local d = M.DumpRow(store.rows[1], {})
-    eq(d.linkSource .. " " .. tostring(d.approximate) .. " " .. d.sgjLink, "iteminfo true " .. base.link, "dump fields")
-    local c = M.LinkSourceCounts(store)
-    eq((c.iteminfo or 0) .. " " .. (c.keytooltip or 0), "1 1", "source counts")
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 14301 }, { itemID = 601 }, { itemID = 701, itemSuffix = 14301 },
+        { itemID = 801, itemSuffix = 14301 } })
+    local r = store.rows
+    M.ApplyInfo(store, r[1], g, 0)
+    M.ApplyInfo(store, r[2], f, 0)
+    M.ApplyInfo(store, r[3], M.MergeInfo(base, nil, 14301), 0)
+    M.ApplyScore(store, r[1], { upgradePct = 2.5 }, nil, 0)
+    M.ApplyScore(store, r[2], { upgradePct = 3 }, nil, 0)
+    M.ApplyScore(store, r[3], nil, "NOT_USABLE", 0)
+    eq(store.info["item:501::::::14301"], nil, "approximate info not cached")
+    eq(M.NeedsQuery(r[1]), true, "scored random suffix group")
+    eq(M.NeedsQuery(r[2]), false, "fixed-stat item")
+    eq(M.NeedsQuery(r[3]), false, "unusable group")
+    eq(M.NeedsQuery(r[4]), false, "not resolved yet")
+    r[1].query = { state = "queued" }
+    eq(M.NeedsQuery(r[1]), false, "already queued")
+    eq((M.FormatUpgrade(r[1])), "+2.5%*", "group starred")
 end)
 
-test("link payload parsing: bonus IDs, item context, prefix and tail", function()
-    local p = M.ParseLink("|cnIQ2:|Hitem:9765::::::::10:1486:::1:3524::::::|h[Cadet Vest]|h|r")
-    eq(p.prefix .. " " .. p.name .. " " .. p.tail, "|cnIQ2: Cadet Vest |r", "parts")
-    eq(p.head[1] .. " " .. p.head[9] .. " " .. p.head[10] .. " [" .. p.head[12] .. "]", "9765 10 1486 []", "fields")
-    eq(table.concat(p.bonus, ","), "3524", "bonus IDs")
-    eq(#p.rest, 6, "rest kept")
-    local q = M.ParseLink("|Hitem:11981::::::::20:1485::1:1:12724::::::|h[Lead Band of the Falcon]|h")
-    eq(q.head[12], "1", "item context")
-    eq(table.concat(q.bonus, ","), "12724", "bonus after the context")
-    local r = M.ParseLink("|cff1eff00|Hitem:102::::::::10:1486:::::::::|h[Cloak]|h|r")
-    eq(#r.bonus, 0, "no bonus IDs")
-    eq(M.ParseLink("item:102"), nil, "not a hyperlink")
-end)
+test("auctions: one row per distinct link, lowest price kept, bid-only marked, cached scores", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 14315, minPrice = 449 }, { itemID = 601, minPrice = 30000 } })
+    local group = store.rows[1]
+    M.ApplyInfo(store, group, M.MergeInfo({ name = "Cadet Vest", link = "|Hitem:501|h[Cadet Vest]|h", quality = 2,
+        equipLoc = "INVTYPE_CHEST" }, { name = "Cadet Vest of Healing" }, 14315), 0)
+    M.ApplyScore(store, group, { upgradePct = 2.5 }, nil, 0)
+    M.ApplyInfo(store, store.rows[2], info("Iron Helm", "INVTYPE_HEAD"), 0)
+    M.ApplyScore(store, store.rows[2], { upgradePct = 3 }, nil, 0)
+    local H1 = "|cnIQ2:|Hitem:501::::::::15:1486:::1:12725::::::|h[Cadet Vest of Healing]|h|r"
+    local H2 = "|cnIQ2:|Hitem:501::::::::15:1486:::1:12726::::::|h[Cadet Vest of Healing]|h|r"
+    local H3 = "|cnIQ2:|Hitem:501::::::::15:1486:::1:12727::::::|h[Cadet Vest of Healing]|h|r"
+    store.scores[H3] = { result = { upgradePct = 7 } } -- judged earlier this session
+    local n = M.SetAuctions(store, group, {
+        { link = H1, buyout = 900 }, { link = H1, buyout = 449 }, { link = H2, bid = 300, buyout = 0 },
+        { link = H3, buyout = 1000, bid = 500 }, { link = nil, buyout = 5 }, { link = H2 },
+    })
+    eq(n, 3, "three distinct links (no link, no price: left out)")
+    local a = group.auctions
+    eq(a[1].link .. " " .. a[1].price .. " " .. tostring(a[1].bid) .. " " .. a[1].auctionCount, H1 .. " 449 false 2",
+        "identical links: lowest buyout")
+    eq(a[2].price .. " " .. tostring(a[2].bid), "300 true", "bid-only (buyout 0): its bid, marked")
+    eq(a[3].price .. " " .. tostring(a[3].bid), "1000 false", "buyout preferred over the bid")
+    eq(a[1].name .. " " .. a[1].linkSource .. " " .. tostring(a[1].approximate) .. " " .. a[1].equipLoc,
+        "Cadet Vest of Healing auction false INVTYPE_CHEST", "auction row info")
+    ok(a[1].isAuction and a[1].group == group, "linked to its group")
+    eq(a[1].state, "pending", "to be judged")
+    eq(a[3].state .. " " .. a[3].upgradePct, "scored 7", "cached score by link")
+    eq(#store.leaves, 4, "the group replaced by its three auctions, plus the helm")
+    eq(store.pending, 2, "two auction rows pending")
+    eq(#M.NextBatch(store, 0, 20), 2, "and due")
+    local c = M.Counts(store)
+    eq(c.gear .. " " .. c.groups .. " " .. c.groupsDone, "4 1 1", "counts: leaves, groups done")
+    eq(M.CountLine(c, true, true), "4 gear items, 2 upgrades, 2 pending", "nothing left resolving")
+    eq(M.CountLine({ total = 3, gear = 3, upgrades = 1, pending = 0, groups = 23, groupsDone = 5 }, true, true),
+        "3 gear items, 1 upgrade, 0 pending, resolving 5/23", "resolving part")
+    eq(M.CountLine({ total = 3, gear = 3, upgrades = 1, pending = 0, groups = 23, groupsDone = 5 }, true, false),
+        "3 gear items, 1 upgrade, 0 pending", "not in exact mode")
 
-test("suffix candidates: bonus list replaced, appended, legacy field 7; display name set", function()
-    local c = M.SuffixCandidates("|cnIQ2:|Hitem:9765::::::::10:1486:::1:3524::::::|h[Cadet Vest]|h|r", 14315,
-        "Cadet Vest of Healing")
-    eq(#c, 3, "three candidates")
-    eq(c[1].source .. " " .. c[1].link,
-        "suffixbonus |cnIQ2:|Hitem:9765::::::::10:1486:::1:14315::::::|h[Cadet Vest of Healing]|h|r", "(a)")
-    eq(c[2].source .. " " .. c[2].link,
-        "suffixbonus+ |cnIQ2:|Hitem:9765::::::::10:1486:::2:3524:14315::::::|h[Cadet Vest of Healing]|h|r", "(b)")
-    local legacy = M.ParseLink(c[3].link)
-    eq(c[3].source .. " " .. legacy.head[7] .. " " .. #legacy.bonus .. " " .. legacy.head[9] .. " " .. #legacy.rest,
-        "suffixfield 14315 0 10 6", "(c): suffix in field 7, no bonus IDs, the rest kept")
-    local ctx = M.SuffixCandidates("|Hitem:11981::::::::20:1485::1:1:12724::::::|h[Lead Band]|h", 999, "Lead Band of X")
-    eq(ctx[1].link, "|Hitem:11981::::::::20:1485::1:1:999::::::|h[Lead Band of X]|h", "item context kept")
-    local plain = M.SuffixCandidates("|cff1eff00|Hitem:102::::::::10:1486:::::::::|h[Cloak]|h|r", 1200, "Cloak of the Bear")
-    eq(#plain, 2, "without bonus IDs (b) equals (a): left out")
-    eq(plain[1].link, "|cff1eff00|Hitem:102::::::::10:1486:::1:1200::::::|h[Cloak of the Bear]|h|r", "(a) added a list")
-    eq(#M.SuffixCandidates("item:102", 1200, "x"), 0, "no hyperlink, no candidates")
+    -- the same results again (more results added): rows kept
+    local first = a[1]
+    M.SetAuctions(store, group, { { link = H1, buyout = 449 }, { link = H2, bid = 300 }, { link = H3, buyout = 1000 } })
+    ok(group.auctions[1] == first, "row kept")
+    -- a rebuild keeps the group's auctions
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 14315, minPrice = 449 } })
+    eq(#store.leaves, 3, "still listed as auctions")
+    local d = M.Dump(store, {})
+    eq(d.groups[1].query .. " " .. d.groups[1].auctionRows, "none 3", "group in the dump")
+    eq(tostring(d.rows[1].auction) .. " " .. d.rows[1].group, "true 501:14315", "auction row in the dump")
+    eq(#M.FindRows(store, "healing"), 4, "debug lookup: the group and its auctions")
 end)
-
 test("count line", function()
     local store = scoredStore(SPEC)
     M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },
