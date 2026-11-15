@@ -94,8 +94,9 @@ end
 
 local function recount(store)
     local leaves = {}
+    local useAuctions = store.useAuctions ~= false
     for _, row in ipairs(store.rows) do
-        if row.auctions then
+        if row.auctions and useAuctions then
             for _, a in ipairs(row.auctions) do leaves[#leaves + 1] = a end
         else
             leaves[#leaves + 1] = row
@@ -413,12 +414,25 @@ function M.SetAuctions(store, group, results)
     return #rows
 end
 
----SGJ's scores changed: forget every score and judge all gear rows again.
+---Exact mode on: groups whose auctions were read are listed as their auction rows; off: as their own
+---(starred) group rows. The auction rows are kept either way.
+function M.SetExactView(store, on)
+    store.useAuctions = on and true or false
+    recount(store)
+end
+
+---SGJ's scores changed: forget every score and judge all gear rows again (groups and auction rows alike,
+---listed or not).
 function M.InvalidateScores(store)
     store.scores = {}
-    for _, row in ipairs(store.leaves) do
+    local function reset(row)
         if row.info and M.IsGear(row.equipLoc) then resetScore(store, row) end
     end
+    for _, row in ipairs(store.rows) do
+        reset(row)
+        for _, a in ipairs(row.auctions or {}) do reset(a) end
+    end
+    recount(store)
 end
 
 ---Up to limit pending rows that are due, in browse order. No scan at all when no row is pending or

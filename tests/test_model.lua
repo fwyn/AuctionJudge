@@ -612,6 +612,28 @@ test("auctions merged by item identity: x count, cheapest kept, buyout before bi
     eq(M.DumpRow(r1, {}).auctionCount .. " " .. M.DumpRow(r1, {}).identity, "2 9765:::::::|12729", "in the dump")
 end)
 
+test("exact view off lists the group rows; rescoring also resets hidden auction rows", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 14315, minPrice = 449 } })
+    local group = store.rows[1]
+    M.ApplyInfo(store, group, M.MergeInfo({ name = "Cadet Vest", link = "|Hitem:501|h[Cadet Vest]|h",
+        equipLoc = "INVTYPE_CHEST" }, { name = "Cadet Vest of Healing" }, 14315), 0)
+    M.ApplyScore(store, group, { upgradePct = 2.5 }, nil, 0)
+    local H1 = "|Hitem:501::::::::15:1486:::1:12725::::::|h[Cadet Vest of Healing]|h"
+    M.SetAuctions(store, group, { { link = H1, buyout = 449 } })
+    M.ApplyScore(store, group.auctions[1], { upgradePct = 15.4 }, nil, 0)
+    ok(store.leaves[1] == group.auctions[1], "auction row listed")
+    M.SetExactView(store, false)
+    ok(store.leaves[1] == group and #store.leaves == 1, "group row listed instead")
+    eq(store.pending, 0, "nothing pending")
+    M.InvalidateScores(store)
+    eq(group.auctions[1].state, "pending", "hidden auction row reset too")
+    eq(store.pending, 1, "only the listed group counted pending")
+    M.SetExactView(store, true)
+    ok(store.leaves[1] == group.auctions[1], "auction row back")
+    eq(store.pending, 1, "the auction row pending")
+end)
+
 test("count line", function()
     local store = scoredStore(SPEC)
     M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },

@@ -96,6 +96,9 @@ local function Client(opts)
             SetOwner = function(self, owner) self.owner = owner end,
             SetHyperlink = function(self, link) self.link = link; self.lines = {} end,
             AddLine = function(self, text) self.lines = self.lines or {}; self.lines[#self.lines + 1] = text end,
+            ClearLines = function(self) self.lines = {} end,
+            Enable = function(self) self.disabled = false end,
+            Disable = function(self) self.disabled = true end,
         }
         setmetatable(w, { __index = function(_, k)
             if allowed[k] then return impl[k] or function() end end
@@ -1084,6 +1087,66 @@ test("exact: an erroring item search disables it for the session", function()
     local X = exactSession({ searchErrors = true })
     ok(X.printedSince(0, "off for this session: SendSearchQuery error: .*search refused"), "said so")
     eq(upgrades(X), "+2.5%*,+3.0%,+2.5%*,+2.5%*", "starred")
+    X.closeAH()
+    clean(X)
+end)
+
+local function exactBox(X) return X.checks()[3] end
+local function clickBox(X, checked)
+    local box = exactBox(X)
+    box.checked = checked -- the client toggles the box before OnClick
+    box.scripts.OnClick(box, "LeftButton")
+end
+
+test("Scan specific items checkbox: off lists starred groups and cancels the queue, on restores", function()
+    local X = exactSession({ wait = 1.6 })
+    local box = exactBox(X)
+    eq(box.label.text .. " " .. tostring(box.checked) .. " " .. tostring(box.disabled), "Scan specific items true false",
+        "third checkbox, checked by default, enabled")
+    for _, c in ipairs(X.checks()) do ok(c.points[1][4] + 24 + c.label.width <= 412, "fits the panel width") end
+    box.scripts.OnEnter(box)
+    eq(X.G.GameTooltip.lines[2], "Looks up the individual auctions of items with random stats to judge them exactly. "
+        .. "Sends extra auction house searches. When off, such items show their base score marked with *.", "tooltip")
+    eq(#X.searches, 1, "first search in flight")
+
+    clickBox(X, false) -- mid-queue
+    eq(X.G.AuctionJudgeDB.exact, false, "saved")
+    eq(X.ns.queue.inflight, nil, "query in flight dropped at once")
+    eq(X.ns.Queue.Length(X.ns.queue), 0, "queue cancelled at once")
+    X.advance(3)
+    eq(#X.searches, 1, "nothing more sent")
+    eq(upgrades(X), "+2.5%*,+3.0%,+2.5%*,+2.5%*", "starred group rows")
+
+    clickBox(X, true)
+    eq(X.G.AuctionJudgeDB.exact, true, "saved")
+    X.advance(4)
+    eq(searched(X), "501:" .. HEALING .. ",501:" .. HEALING .. ",501:" .. WHALE .. ",501:" .. INTELLECT,
+        "the unresolved groups queued again (the dropped one searched again)")
+    eq(upgrades(X), "+15.4%,+9.0%,+11.8%,+3.0%,+6.0%", "exact rows")
+
+    -- resolved groups go back to their starred rows and return without searching again
+    clickBox(X, false)
+    eq(X.rowNames(), "Cadet Vest of Healing,Iron Helm,Cadet Vest of the Whale,Cadet Vest of Intellect", "group rows")
+    eq(upgrades(X), "+2.5%*,+3.0%,+2.5%*,+2.5%*", "starred")
+    -- the slash command and the box stay in sync
+    X.slash("exact on")
+    X.advance(0.5)
+    eq(exactBox(X).checked, true, "box follows /aj exact on")
+    eq(upgrades(X), "+15.4%,+9.0%,+11.8%,+3.0%,+6.0%", "auction rows back")
+    eq(#X.searches, 4, "no new searches")
+    X.slash("exact off")
+    X.advance(0.5)
+    eq(exactBox(X).checked, false, "box follows /aj exact off")
+    X.closeAH()
+    clean(X)
+end)
+
+test("Scan specific items checkbox is greyed with the reason when the search functions are missing", function()
+    local X = exactSession({ noSearchAPI = true })
+    local box = exactBox(X)
+    eq(tostring(box.disabled) .. " " .. box.label.color[1], "true 0.5", "disabled and greyed")
+    box.scripts.OnEnter(box)
+    ok(X.G.GameTooltip.lines[2]:find("Not available this session: SendSearchQuery missing.", 1, true), "reason in the tooltip")
     X.closeAH()
     clean(X)
 end)

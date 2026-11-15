@@ -58,6 +58,7 @@ local function initDB()
     if not known then db.sortColumn, db.sortDesc = DEFAULTS.sortColumn, DEFAULTS.sortDesc end
     if type(db.maxQueries) ~= "number" or db.maxQueries < 0 then db.maxQueries = DEFAULTS.maxQueries end
     ns.db = db
+    M.SetExactView(store, db.exact)
 end
 
 ---Item searches for random suffix groups are on: setting on, API working, SGJ there to judge.
@@ -79,6 +80,7 @@ local function buildView()
         counts = M.Counts(store),
         full = store.full,
         exact = exactActive(),
+        exactDisabled = exactDisabled,
         list = usable and M.View(store, db) or {},
         opts = db,
     }
@@ -298,7 +300,24 @@ function ns.SortBy(col)
     refresh()
 end
 
+---Exact mode ("Scan specific items", /aj exact): off cancels the queue at once and lists resolved groups as
+---their starred group rows again; on lists their auctions again and queues the groups not resolved yet.
+local function setExact(on)
+    ns.db.exact = on and true or false
+    if ns.db.exact then
+        M.SetExactView(store, true)
+        enqueueAll()
+    else
+        Q.Cancel(queue)
+        M.SetExactView(store, false)
+    end
+    Panel.ResetScroll()
+    markDirty()
+    refresh()
+end
+
 function ns.SetOption(key, value)
+    if key == "exact" then return setExact(value) end
     ns.db[key] = value and true or false
     Panel.ResetScroll()
     refresh()
@@ -532,11 +551,9 @@ local function slash(msg)
     elseif cmd == "debug" then
         if arg ~= "" then debugFind(arg) else debug() end
     elseif cmd == "exact" and (arg == "on" or arg == "off") then
-        ns.db.exact = arg == "on"
-        if ns.db.exact then enqueueAll() else Q.Cancel(queue) end
+        setExact(arg == "on")
         ns.Print("exact scores for random suffix items " .. arg .. (exactDisabled and (" (disabled this session: "
             .. exactDisabled .. ")") or ""))
-        markDirty()
     elseif cmd == "maxqueries" and tonumber(arg) then
         ns.db.maxQueries = math.max(0, math.floor(tonumber(arg)))
         ns.Print("at most " .. ns.db.maxQueries .. " item searches per auction house search")

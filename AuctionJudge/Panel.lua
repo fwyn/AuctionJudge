@@ -55,15 +55,41 @@ local function makeHeader(col)
     headers[col.id] = b
 end
 
-local function makeCheck(key, label, x)
+-- tooltip of the "Scan specific items" checkbox; the reason it is off for the session is added below
+local EXACT_TIP = "Looks up the individual auctions of items with random stats to judge them exactly. "
+    .. "Sends extra auction house searches. When off, such items show their base score marked with *."
+
+local function makeCheck(key, label, x, width, tip)
     local c = CreateFrame("CheckButton", nil, frame, "UICheckButtonTemplate")
     c:SetSize(22, 22)
     c:SetPoint("TOPLEFT", frame, "TOPLEFT", x, -50)
     local fs = text(c, "GameFontHighlightSmall")
     fs:SetPoint("LEFT", c, "RIGHT", 2, 0)
+    fs:SetWidth(width) -- the three fit the panel width side by side
     fs:SetText(label)
+    c.label = fs
     c:SetScript("OnClick", function(self) ns.SetOption(key, self:GetChecked() and true or false) end)
+    if tip then
+        c:SetScript("OnEnter", function(self)
+            pcall(function()
+                GameTooltip:SetOwner(self, "ANCHOR_TOP")
+                GameTooltip:ClearLines()
+                GameTooltip:AddLine(label, 1, 0.82, 0)
+                GameTooltip:AddLine(tip(), 1, 1, 1, true)
+                GameTooltip:Show()
+            end)
+        end)
+        c:SetScript("OnLeave", function() pcall(function() GameTooltip:Hide() end) end)
+    end
     checks[key] = c
+end
+
+local exactDisabledReason
+local function exactTip()
+    if exactDisabledReason then
+        return EXACT_TIP .. " Not available this session: " .. exactDisabledReason .. "."
+    end
+    return EXACT_TIP
 end
 
 local function makeRow(i)
@@ -138,8 +164,10 @@ local function create(ah)
     countLine:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -30)
     countLine:SetWidth(WIDTH - 20)
 
-    makeCheck("upgradesOnly", "Upgrades only", 8)
-    makeCheck("hideUnusable", "Hide unusable", 140)
+    -- 3 x (22 box + 2 + label) in 404 px: 8 + 24 + 96, 132 + 24 + 96, 256 + 24 + 128 = 408
+    makeCheck("upgradesOnly", "Upgrades only", 8, 96)
+    makeCheck("hideUnusable", "Hide unusable", 132, 96)
+    makeCheck("exact", "Scan specific items", 256, 128, exactTip)
 
     for _, col in ipairs(COLS) do makeHeader(col) end
     for i = 1, ROWS do makeRow(i) end
@@ -212,6 +240,16 @@ function Panel.Refresh(view)
     title:SetText("AuctionJudge" .. (view.spec and (": " .. view.spec) or ""))
     checks.upgradesOnly:SetChecked(opts.upgradesOnly and true or false)
     checks.hideUnusable:SetChecked(opts.hideUnusable and true or false)
+    local exact = checks.exact
+    exact:SetChecked(opts.exact and true or false)
+    exactDisabledReason = view.exactDisabled
+    if exactDisabledReason then
+        exact:Disable()
+        exact.label:SetTextColor(0.5, 0.5, 0.5)
+    else
+        exact:Enable()
+        exact.label:SetTextColor(1, 1, 1)
+    end
     for _, col in ipairs(COLS) do
         local label = M.COLUMN_LABEL[col.id]
         if opts.sortColumn == col.id then label = label .. (opts.sortDesc and " v" or " ^") end
