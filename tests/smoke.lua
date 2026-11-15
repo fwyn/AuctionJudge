@@ -872,10 +872,12 @@ local function auctionLink(bonus, name)
 end
 local H1, H2 = auctionLink(12725, "Cadet Vest of Healing"), auctionLink(12726, "Cadet Vest of Healing")
 local W1, I1 = auctionLink(12730, "Cadet Vest of the Whale"), auctionLink(12740, "Cadet Vest of Intellect")
+-- the same item as H1, differing only in link metadata (item context 1, a modifier pair), as seen in the game
+local H1b = "|cnIQ2:|Hitem:501::::::::15:1486::1:1:12725:1:28:5256:::::|h[Cadet Vest of Healing]|h|r"
 -- the base item 2.5%, the auctions what SGJ's tooltip shows on each
 local EXACT_PCT = { [501] = 2.5, [601] = 3, [701] = "NOT_USABLE", [H1] = 15.4, [H2] = 9, [W1] = 11.8, [I1] = 6 }
 local AUCTIONS = {
-    ["501:" .. HEALING] = { { link = H1, buyout = 449 }, { link = H1, buyout = 900 }, { link = H2, bid = 300 } },
+    ["501:" .. HEALING] = { { link = H1, buyout = 449 }, { link = H1b, buyout = 900 }, { link = H2, bid = 300 } },
     ["501:" .. WHALE] = { { link = W1, buyout = 50000 } },
     ["501:" .. INTELLECT] = { { link = I1, buyout = 155000 } },
 }
@@ -937,21 +939,22 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     ok(X.searches[1].at >= X.browseAt + 1.5 - 1e-9, "held off 1.5 s after the browse results")
     eq(X.searches[1].sorts[1].sortOrder, 4, "sorted by buyout")
     ok(X.searches[1].itemKey == X.results[1].itemKey, "the browse result's own item key is passed")
-    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of Healing,Cadet Vest of the Whale,Iron Helm,"
-        .. "Cadet Vest of Intellect", "one row per distinct auction link, by value")
+    eq(X.rowNames(), "Cadet Vest of Healing x2,Cadet Vest of Healing,Cadet Vest of the Whale,Iron Helm,"
+        .. "Cadet Vest of Intellect", "one row per distinct item (link metadata ignored), by value")
     eq(upgrades(X), "+15.4%,+9.0%,+11.8%,+3.0%,+6.0%", "exact scores, none starred")
     local rows = X.shownRows()
-    eq(rows[1].cells.price.text, "coin:449", "identical links: the lowest buyout kept")
+    eq(rows[1].cells.price.text, "coin:449", "same item: the lowest buyout kept")
     eq(rows[2].cells.price.text, "coin:300 bid", "bid-only auction priced at its bid, marked")
     local healing = X.ns.store.byKey["501:" .. HEALING]
-    eq(#healing.auctions, 2, "two distinct links")
+    eq(#healing.auctions, 2, "two distinct items")
+    eq(healing.auctions[1].link, H1, "the cheaper auction's link")
     eq(healing.auctions[1].sgjLink, H1, "SGJ judged the auction's link")
     eq(countLine(X), "6 gear items, 5 upgrades, 0 pending", "count line, nothing left resolving")
     eq(X.updaters(), 0, "idle once done")
     local n = #X.printed
     X.slash("debug healing")
     ok(X.printedSince(n, "item search resolved, 1 attempt, 3 results, 2 rows, listed as its auction rows"), "group line")
-    ok(X.printedSince(n, "auction of group 501:" .. HEALING .. " %(2 auctions with this link%)"), "auction line")
+    ok(X.printedSince(n, "auction of group 501:" .. HEALING .. " %(2 auctions of this item%)"), "auction line")
     n = #X.printed
     X.slash("status")
     ok(X.printedSince(n, "Exact scores: on; random suffix groups 3, done 3; queue 0 queued, 3 sent this search %(max 60%), "

@@ -333,41 +333,74 @@ function M.InfoArrived(store, itemID)
     return any
 end
 
+---The item an auction link describes, as a string: item id, enchant, gems and suffix field (payload fields
+---1-8) and the bonus IDs (field 13 is their count; sorted). Link level, spec, modifier mask, item context,
+---the modifier section after the bonus IDs (a count, then type:value pairs), colour and name are left
+---out: auctions differing only there are the same item. A link that cannot be parsed is its own identity.
+function M.ItemIdentity(link)
+    if type(link) ~= "string" then return nil end
+    local payload = link:match("|Hitem:([^|]*)") or link:match("^item:([^|]*)")
+    if not payload then return link end
+    local f = {}
+    for x in (payload .. ":"):gmatch("([^:]*):") do f[#f + 1] = x end
+    if not tonumber(f[1]) then return link end
+    local head = {}
+    for i = 1, 8 do
+        local x = f[i] or ""
+        if i > 1 and tonumber(x) == 0 then x = "" end
+        head[i] = x
+    end
+    local n = tonumber(f[13]) or 0
+    local bonus = {}
+    for i = 14, 13 + n do
+        local b = tonumber(f[i])
+        if not b then return link end -- fewer bonus IDs than counted: not a link we understand
+        bonus[#bonus + 1] = b
+    end
+    table.sort(bonus)
+    return table.concat(head, ":") .. "|" .. table.concat(bonus, ":")
+end
+
 ---A group's item search results arrived: results { link, buyout, bid, quantity } (plain values). The group
----is listed as one row per distinct link (the lowest price kept; price is the buyout, else the bid, then
----marked bid), each judged by its own link. Rows take item info from the group and cached scores.
+---is listed as one row per distinct item (ItemIdentity), with the lowest-priced auction's link (price is
+---the buyout, else the bid, then marked bid; at the same price a buyout wins) and the number of auctions
+---merged. Each row is judged by its own link; rows take item info from the group and cached scores.
 ---Returns the number of auction rows.
 function M.SetAuctions(store, group, results)
-    local byLink, order = {}, {}
+    local byId, order = {}, {}
     for _, r in ipairs(results) do
         local link = r.link
         local buyout, bid = tonumber(r.buyout), tonumber(r.bid)
         if buyout == 0 then buyout = nil end
         local price = buyout or bid
         if type(link) == "string" and link:find("item:", 1, true) and price then
-            local a = byLink[link]
+            local id = M.ItemIdentity(link)
+            local a = byId[id]
+            local isBid = buyout == nil
             if not a then
-                order[#order + 1] = link
-                byLink[link] = { price = price, bid = buyout == nil, count = 1 }
+                order[#order + 1] = id
+                byId[id] = { link = link, price = price, bid = isBid, count = 1 }
             else
                 a.count = a.count + 1
-                if price < a.price then a.price, a.bid = price, buyout == nil end
+                if price < a.price or (price == a.price and a.bid and not isBid) then
+                    a.link, a.price, a.bid = link, price, isBid
+                end
             end
         end
     end
     local old = {}
-    for _, a in ipairs(group.auctions or {}) do old[a.link] = a end
+    for _, a in ipairs(group.auctions or {}) do old[a.identity] = a end
     local rows = {}
-    for i, link in ipairs(order) do
-        local a = byLink[link]
-        local row = old[link]
+    for i, id in ipairs(order) do
+        local a = byId[id]
+        local row = old[id]
         if not row then
             row = { key = group.key .. "#" .. i, itemID = group.itemID, suffix = group.suffix,
-                itemLevel = group.itemLevel, itemString = link, isAuction = true, group = group,
+                itemLevel = group.itemLevel, itemString = a.link, isAuction = true, group = group, identity = id,
                 state = "pending", tries = 0, nextTry = 0 }
             row.price = a.price
             M.ApplyInfo(store, row, {
-                name = M.LinkName(link) or group.name, link = link, linkSource = "auction",
+                name = M.LinkName(a.link) or group.name, link = a.link, linkSource = "auction",
                 quality = group.quality, icon = group.icon, equipLoc = group.equipLoc,
             })
         end
@@ -496,7 +529,7 @@ function M.DumpRow(row, opts)
         price = row.price, value = row.value, shown = hidden == nil, hiddenBy = hidden,
         linkSource = row.linkSource, approximate = row.approximate == true, sgjLink = row.sgjLink,
         auction = row.isAuction == true, group = row.group and row.group.key or nil, bid = row.bid == true,
-        auctionCount = row.auctionCount, query = M.QueryText(row),
+        auctionCount = row.auctionCount, identity = row.identity, query = M.QueryText(row),
     }
 end
 
@@ -571,7 +604,7 @@ function M.DebugLines(d)
     local where
     if d.auction then
         where = "; auction of group " .. d.group .. (d.auctionCount and d.auctionCount > 1 and
-            (" (" .. d.auctionCount .. " auctions with this link)") or "")
+            (" (" .. d.auctionCount .. " auctions of this item)") or "")
     else
         local resolved = d.query and d.query:find("^resolved")
         where = (d.query and ("; item search " .. d.query .. (resolved and ", listed as its auction rows" or "")) or "")
@@ -666,6 +699,13 @@ function M.FormatMoney(copper)
         return format("%ds", s)
     end
     return format("%dc", c)
+end
+
+---The name shown for a row: "Cadet Vest of the Whale x4" when several auctions of the item were merged.
+function M.DisplayName(row)
+    local name = row.name or row.itemString or "?"
+    if row.auctionCount and row.auctionCount > 1 then name = name .. " x" .. row.auctionCount end
+    return name
 end
 
 ---Upgrade column text and colour key.

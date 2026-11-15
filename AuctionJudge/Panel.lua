@@ -193,7 +193,7 @@ local function fill(b, row)
     b.icon:SetTexture(row.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
     local q = M.QUALITY_RGB[row.quality or 1] or M.QUALITY_RGB[1]
     local c = b.cells
-    c.name:SetText(row.name or row.itemString)
+    c.name:SetText(M.DisplayName(row))
     c.name:SetTextColor(q[1], q[2], q[3])
     c.price:SetText(Game.CoinText(row.price) .. (row.bid and " bid" or ""))
     local up, key = M.FormatUpgrade(row)

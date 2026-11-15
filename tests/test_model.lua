@@ -575,6 +575,43 @@ test("auctions: one row per distinct link, lowest price kept, bid-only marked, c
     eq(tostring(d.rows[1].auction) .. " " .. d.rows[1].group, "true 501:14315", "auction row in the dump")
     eq(#M.FindRows(store, "healing"), 4, "debug lookup: the group and its auctions")
 end)
+test("item identity: link metadata and modifiers ignored, bonus IDs kept", function()
+    local a = "|Hitem:9765::::::::10:1486:::1:12729::::::|h[Cadet Vest of Intellect]|h"
+    local b = "|cnIQ2:|Hitem:9765::::::::10:1486::1:1:12729:1:28:5256:::::|h[Cadet Vest of Intellect]|h|r"
+    eq(M.ItemIdentity(a), "9765:::::::|12729", "identity")
+    eq(M.ItemIdentity(b), M.ItemIdentity(a), "context, modifier pair, level, colour: same item")
+    ok(M.ItemIdentity("|Hitem:9765::::::::10:1486:::1:12730::::::|h[x]|h") ~= M.ItemIdentity(a), "other bonus ID")
+    -- the modifier section (count 2, then 28:5256 and 9:15) is not read as bonus IDs
+    eq(M.ItemIdentity("|Hitem:9765::::::::10:1486::1:2:12729:3524:2:28:5256:9:15::::|h[x]|h"), "9765:::::::|3524:12729",
+        "two bonus IDs, sorted; modifiers left out")
+    eq(M.ItemIdentity("|Hitem:9765::::::::10:1486::1:2:3524:12729:1:28:1::::|h[x]|h"), "9765:::::::|3524:12729",
+        "bonus order does not matter")
+    ok(M.ItemIdentity("|Hitem:9765:5:::::::10:1486:::1:12729::::::|h[x]|h") ~= M.ItemIdentity(a), "enchant counts")
+    eq(M.ItemIdentity("|Hitem:9765:0:::::::10:1486:::1:12729::::::|h[x]|h"), M.ItemIdentity(a), "enchant 0 is none")
+    eq(M.ItemIdentity("|Hitem:junk|h[x]|h"), "|Hitem:junk|h[x]|h", "unparsable: the raw link")
+    eq(M.ItemIdentity("|Hitem:9765::::::::10:1486:::3:12729|h[x]|h"), "|Hitem:9765::::::::10:1486:::3:12729|h[x]|h",
+        "fewer bonus IDs than counted: the raw link")
+end)
+
+test("auctions merged by item identity: x count, cheapest kept, buyout before bid at the same price", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 9765, itemSuffix = 14309, minPrice = 500 } })
+    local group = store.rows[1]
+    M.ApplyInfo(store, group, M.MergeInfo({ name = "Cadet Vest", link = "|Hitem:9765|h[Cadet Vest]|h",
+        equipLoc = "INVTYPE_CHEST" }, { name = "Cadet Vest of Intellect" }, 14309), 0)
+    local a = "|Hitem:9765::::::::10:1486:::1:12729::::::|h[Cadet Vest of Intellect]|h"
+    local b = "|cnIQ2:|Hitem:9765::::::::10:1486::1:1:12729:1:28:5256:::::|h[Cadet Vest of Intellect]|h|r"
+    local c = "|Hitem:9765::::::::10:1486:::1:12731::::::|h[Cadet Vest of Intellect]|h"
+    eq(M.SetAuctions(store, group, { { link = a, buyout = 700 }, { link = b, buyout = 500 }, { link = c, bid = 400 },
+        { link = c, buyout = 400 } }), 2, "the two links of one item are one row; another bonus ID is another")
+    local r1, r2 = group.auctions[1], group.auctions[2]
+    eq(r1.auctionCount .. " " .. r1.price .. " " .. r1.link, "2 500 " .. b, "merged: cheapest auction's link and price")
+    eq(M.DisplayName(r1), "Cadet Vest of Intellect x2", "count after the name")
+    eq(r2.price .. " " .. tostring(r2.bid), "400 false", "same price: the buyout wins over the bid-only auction")
+    eq(M.DisplayName({ name = "Solo", auctionCount = 1 }), "Solo", "no count for one auction")
+    eq(M.DumpRow(r1, {}).auctionCount .. " " .. M.DumpRow(r1, {}).identity, "2 9765:::::::|12729", "in the dump")
+end)
+
 test("count line", function()
     local store = scoredStore(SPEC)
     M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },
