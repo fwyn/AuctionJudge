@@ -93,19 +93,20 @@ end
 -- Items
 ---------------------------------------------------------------------------
 
----The equip location without needing the item cached ("" for non-gear), or nil when unknown.
+---The equip location without needing the item cached ("" for non-gear), or nil when unknown (no
+---function, a failed call, or a missing, secret or non-string value). Unknown is never "not gear".
 function Game.InstantEquipLoc(itemID)
     local f = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
     if type(f) ~= "function" then return nil end
     local ok, id, _, _, equipLoc = pcall(f, itemID)
     if not ok or id == nil then return nil end
     equipLoc = plain(equipLoc)
-    if equipLoc == nil then return "" end
     if type(equipLoc) ~= "string" then return nil end
     return equipLoc
 end
 
 ---{ name, link, quality, icon, equipLoc } for an item string, or nil while the item is not cached.
+---equipLoc is nil when it cannot be read (missing, secret): unknown, not "not gear".
 function Game.ItemInfo(itemString)
     local f = (C_Item and C_Item.GetItemInfo) or GetItemInfo
     if type(f) ~= "function" then return nil end
@@ -118,7 +119,7 @@ function Game.ItemInfo(itemString)
         name = name,
         link = type(link) == "string" and link or nil,
         quality = type(quality) == "number" and quality or nil,
-        equipLoc = type(equipLoc) == "string" and equipLoc or "",
+        equipLoc = type(equipLoc) == "string" and equipLoc or nil,
         icon = icon,
     }
 end

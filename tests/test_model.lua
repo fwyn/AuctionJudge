@@ -61,10 +61,9 @@ test("item string with a suffix puts it in the 7th field", function()
     eq(M.ItemString(15210, -37), "item:15210::::::-37", "negative suffix kept")
 end)
 
-test("row key separates suffix and item level", function()
-    ok(M.RowKey(1, 0, 60) ~= M.RowKey(1, 5, 60), "suffix")
-    ok(M.RowKey(1, 0, 60) ~= M.RowKey(1, 0, 61), "item level")
-    eq(M.RowKey(1, nil, nil), "1:0:0", "missing parts are 0")
+test("row key: item and suffix, the same parts as the item string", function()
+    ok(M.RowKey(1, 0) ~= M.RowKey(1, 5), "suffix")
+    eq(M.RowKey(1, nil), "1:0", "missing suffix is 0")
 end)
 
 test("gear filter by equip location", function()
@@ -93,13 +92,27 @@ test("duplicate item keys keep the lower price, in either order", function()
         { itemID = 10, itemLevel = 60, itemSuffix = 7, minPrice = 8000 },
     })
     eq(#store.rows, 3, "rows")
-    eq(store.byKey["10:0:60"].price, 3000, "lower second")
-    eq(store.byKey["10:0:60"].quantity, 2, "quantity of the cheaper entry")
-    eq(store.byKey["11:0:0"].price, 100, "lower first")
-    eq(store.byKey["10:7:60"].price, 8000, "suffix row separate")
-    eq(store.byKey["10:7:60"].itemString, "item:10::::::7", "suffix row item string")
+    eq(store.byKey["10:0"].price, 3000, "lower second")
+    eq(store.byKey["10:0"].quantity, 2, "quantity of the cheaper entry")
+    eq(store.byKey["11:0"].price, 100, "lower first")
+    eq(store.byKey["10:7"].price, 8000, "suffix row separate")
+    eq(store.byKey["10:7"].itemString, "item:10::::::7", "suffix row item string")
     eq(#store.byItem[10], 2, "both rows indexed by item id")
     eq(store.lastCount, 5, "entries counted")
+end)
+
+test("item level variants of one item string are one row with the lowest price (one link, one score)", function()
+    local store = M.NewStore()
+    M.Rebuild(store, {
+        { itemID = 20, itemLevel = 60, minPrice = 9000 },
+        { itemID = 20, itemLevel = 63, minPrice = 4000 },
+        { itemID = 20, itemLevel = 58, minPrice = 6000 },
+    })
+    eq(#store.rows, 1, "one row")
+    local row = store.rows[1]
+    eq(row.price, 4000, "lowest price")
+    eq(row.itemLevel, 63, "item level of the cheapest entry")
+    eq(#M.NextBatch(store, 0, 20), 1, "scored once")
 end)
 
 test("rebuild skips bad entries, keeps known rows, takes info and scores from the caches", function()
@@ -201,30 +214,76 @@ test("batches: limited size, due rows only, backoff, give up", function()
     local b1 = M.NextBatch(store, 0, 20)
     eq(#b1, 20, "first batch limited")
     eq(b1[1].itemID, 1, "browse order")
-    for _, row in ipairs(b1) do M.Defer(row, 0, "ITEM_INFO") end
+    for _, row in ipairs(b1) do M.Defer(store, row, 0, "ITEM_INFO") end
     local b2 = M.NextBatch(store, 0, 20)
     eq(#b2, 20, "second batch")
     eq(b2[1].itemID, 21, "deferred rows are not due")
-    for _, row in ipairs(b2) do M.Defer(row, 0, "ITEM_INFO") end
+    for _, row in ipairs(b2) do M.Defer(store, row, 0, "ITEM_INFO") end
     eq(#M.NextBatch(store, 0, 20), 5, "the rest")
     eq(#M.NextBatch(store, M.RETRY_BASE, 100), 45, "all due after the first delay")
 
     local row = store.rows[1]
     local delays = {}
     for i = 2, 6 do
-        M.Defer(row, 100, "ITEM_INFO")
+        M.Defer(store, row, 100, "ITEM_INFO")
         delays[#delays + 1] = row.nextTry - 100
     end
     eq(table.concat(delays, ","), "1,2,4,5,5", "doubling up to the maximum")
-    for _ = 7, M.MAX_TRIES do M.Defer(row, 100, "NOT_READY") end
+    for _ = 7, M.MAX_TRIES do M.Defer(store, row, 100, "NOT_READY") end
     eq(row.state, "error", "gave up")
     eq(row.reason, "GAVE_UP NOT_READY", "reason names the last wait")
+end)
+
+test("unknown equip location (unreadable) is not \"not gear\": it waits for a bounded retry, uncached", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1, equipLoc = nil }, { itemID = 2 } })
+    eq(store.rows[1].state, "pending", "unknown instant equip location stays eligible")
+    local row = store.rows[2]
+    M.ApplyInfo(store, row, { name = "Veiled Gloves", link = "|Hitem:2|h", equipLoc = nil }, 10)
+    eq(row.state, "pending", "unknown full-info equip location: pending")
+    eq(row.info, nil, "info not taken")
+    eq(row.reason, "EQUIP_LOC_UNKNOWN", "reason")
+    eq(row.nextTry, 10 + M.RETRY_BASE, "retried later")
+    eq(store.info[row.itemString], nil, "never cached")
+    M.ApplyInfo(store, row, { name = "Veiled Gloves", link = "|Hitem:2|h", equipLoc = "INVTYPE_HANDS" }, 11)
+    eq(row.state, "pending", "now known gear: waiting for a score")
+    eq(row.info, true, "info taken")
+    eq(row.tries, 0, "tries reset for scoring")
+    for i = 1, M.MAX_TRIES do M.ApplyInfo(store, store.rows[1], { name = "X", equipLoc = nil }, i) end
+    eq(store.rows[1].state, "error", "bounded: gives up as an error, not as not gear")
+end)
+
+test("pending count: batches do no scan when nothing is pending or due", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3, equipLoc = "" } })
+    eq(store.pending, 2, "two pending after rebuild")
+    M.ApplyInfo(store, store.rows[1], info("A"), 0)
+    M.ApplyScore(store, store.rows[1], { upgradePct = 1 }, nil, 0)
+    M.ApplyInfo(store, store.rows[2], info("B", "INVTYPE_BAG"), 0)
+    eq(store.pending, 0, "none pending")
+    -- a pending row slipped in behind the bookkeeping would be found by any scan
+    local sentinel = { key = "s", state = "pending", nextTry = 0 }
+    table.insert(store.rows, sentinel)
+    eq(#M.NextBatch(store, 100, 20), 0, "no scan with nothing pending")
+    table.remove(store.rows)
+
+    M.InvalidateScores(store)
+    eq(store.pending, 1, "the scored gear row is pending again")
+    eq(#M.NextBatch(store, 0, 20), 1, "and due")
+    M.Defer(store, store.rows[1], 0, "NOT_READY")
+    eq(store.nextDue, M.RETRY_BASE, "next due at the retry")
+    table.insert(store.rows, sentinel)
+    eq(#M.NextBatch(store, 0.1, 20), 0, "no scan before the next retry is due")
+    table.remove(store.rows)
+    eq(#M.NextBatch(store, M.RETRY_BASE, 20), 1, "due again")
+    M.Clear(store)
+    eq(store.pending, 0, "cleared")
 end)
 
 test("item info arriving makes waiting rows of that item due", function()
     local store = M.NewStore()
     M.Rebuild(store, { { itemID = 7 }, { itemID = 7, itemSuffix = 3 }, { itemID = 8 } })
-    for _, row in ipairs(store.rows) do M.Defer(row, 0, "ITEM_INFO") end
+    for _, row in ipairs(store.rows) do M.Defer(store, row, 0, "ITEM_INFO") end
     eq(#M.NextBatch(store, 0.1, 20), 0, "none due")
     eq(M.InfoArrived(store, 7), true, "rows found")
     eq(M.InfoArrived(store, 99), false, "unknown item")
@@ -236,7 +295,7 @@ test("SCORES_CHANGED resets gear rows and drops the cache, not-gear rows stay", 
     local store = scoredStore({ { "A", 10000, "scored", 2 }, { "B", 10000, "unusable" }, { "C", 10000, "pending" } })
     M.Rebuild(store, { { itemID = 1, minPrice = 10000 }, { itemID = 2, minPrice = 10000 }, { itemID = 3, minPrice = 10000 },
         { itemID = 4, equipLoc = "" } })
-    M.Defer(store.rows[3], 0, "NOT_READY")
+    M.Defer(store, store.rows[3], 0, "NOT_READY")
     M.InvalidateScores(store)
     eq(next(store.scores), nil, "cache dropped")
     for i = 1, 3 do

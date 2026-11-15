@@ -131,10 +131,12 @@ local function Client(opts)
         local name = it.name .. (suffix ~= 0 and (suffixes[suffix] or "") or "")
         local istr = suffix ~= 0 and ("item:" .. id .. "::::::" .. suffix) or ("item:" .. id)
         local link = "|cff1eff00|H" .. istr .. "::::::::60:::::|h[" .. name .. "]|h|r"
-        return name, link, it.quality or 2, 60, 55, "Armor", "Plate", 1, it.equipLoc, "icon" .. id
+        local loc = it.secretFull and C.SECRET or it.equipLoc
+        return name, link, it.quality or 2, 60, 55, "Armor", "Plate", 1, loc, "icon" .. id
     end
 
-    G.issecretvalue = function() return false end
+    C.SECRET = setmetatable({}, { __tostring = function() return "<secret>" end })
+    G.issecretvalue = function(v) return v == C.SECRET end
     G.GetTime = function() return C.clock end
     G.print = function(...)
         local parts = {}
@@ -161,14 +163,21 @@ local function Client(opts)
             count("GetItemInfoInstant")
             local it = items[id]
             if not it then return nil end
-            return id, "Armor", "Plate", it.equipLoc, "icon" .. id, 4, 4
+            return id, "Armor", "Plate", it.secretInstant and C.SECRET or it.equipLoc, "icon" .. id, 4, 4
         end,
         GetItemNameByID = function(id) local it = items[id]; return it and it.cached and it.name or nil end,
         RequestLoadItemDataByID = function(id) C.requested[id] = (C.requested[id] or 0) + 1 end,
     }
     -- Auction house: the addon may only read.
     C.results, C.full = {}, true
-    local function forbidden(name) return function() error("AuctionJudge must not call C_AuctionHouse." .. name) end end
+    -- Every attempt is recorded before throwing: a pcall in the addon could swallow the error.
+    C.forbidden = {}
+    local function forbidden(name)
+        return function()
+            C.forbidden[#C.forbidden + 1] = name
+            error("AuctionJudge must not call C_AuctionHouse." .. name)
+        end
+    end
     G.C_AuctionHouse = {
         GetBrowseResults = function()
             count("GetBrowseResults")
@@ -400,7 +409,9 @@ end)
 
 test("auction house opens: panel created on the right edge, no results yet", function()
     C.openAH()
+    eq(C.updaters(), 1, "work loop started")
     C.advance(0.3)
+    eq(C.updaters(), 0, "work loop stopped when idle")
     local p = C.panel()
     ok(p, "panel created as a child of AuctionHouseFrame")
     eq(p.width, 420, "width")
@@ -412,7 +423,6 @@ test("auction house opens: panel created on the right edge, no results yet", fun
     ok(C.hasText("^AuctionJudge: Retribution: Raid$"), "title with the spec")
     ok(C.hasText("No browse results yet"), "empty count line")
     eq(#C.rows(), 20, "20 rows")
-    eq(C.updaters(), 1, "work loop running")
 end)
 
 test("results arrive: gear kept, duplicates priced low, uncached items wait", function()
@@ -427,6 +437,7 @@ test("results arrive: gear kept, duplicates priced low, uncached items wait", fu
         result(202, 10000),            -- bag
         result(203, 10000),            -- tabard, uncached: filtered by GetItemInfoInstant
         result(101, 80000),            -- same key, dearer
+        result(101, 60000, 0, 63),     -- item level variant: same item string, same row
         { itemKey = { itemID = 0, battlePetSpeciesID = 39, itemLevel = 1, itemSuffix = 0 }, minPrice = 100,
             totalQuantity = 1 }, -- battle pet
     }
@@ -437,12 +448,12 @@ test("results arrive: gear kept, duplicates priced low, uncached items wait", fu
     eq(C.calls.GetBrowseResults - reads, 1, "one read for both events")
     local store = C.ns.store
     eq(#store.rows, 9, "one row per item key, pet skipped")
-    eq(store.byKey["101:0:60"].price, 50000, "lower price kept")
-    eq(store.byKey["102:1200:60"].name, "Bandit's Cloak of the Bear", "suffix resolved through the item string")
-    eq(store.byKey["203:0:60"].state, "notgear", "tabard")
-    eq(store.byKey["202:0:60"].state, "notgear", "bag")
-    eq(store.byKey["201:0:60"].state, "notgear", "cloth")
-    eq(store.byKey["103:0:60"].state, "pending", "uncached robe")
+    eq(store.byKey["101:0"].price, 50000, "lower price kept")
+    eq(store.byKey["102:1200"].name, "Bandit's Cloak of the Bear", "suffix resolved through the item string")
+    eq(store.byKey["203:0"].state, "notgear", "tabard")
+    eq(store.byKey["202:0"].state, "notgear", "bag")
+    eq(store.byKey["201:0"].state, "notgear", "cloth")
+    eq(store.byKey["103:0"].state, "pending", "uncached robe")
     ok(C.requested[103] and C.requested[104], "uncached items requested")
     eq(C.requested[203], nil, "the tabard is never requested")
     eq(C.rowNames(), "Lionheart Helm,Bandit's Cloak of the Bear", "upgrades by % per gold")
@@ -463,8 +474,8 @@ test("uncached items resolve on GET_ITEM_INFO_RECEIVED and get scored", function
     items[103].cached, items[104].cached = true, true
     C.fire("GET_ITEM_INFO_RECEIVED", 103, true)
     C.fire("GET_ITEM_INFO_RECEIVED", 104, true)
-    C.advance(0.2)
-    eq(C.ns.store.byKey["103:0:60"].state, "scored", "robe scored")
+    C.advance(0.5) -- one batch, then the next list refresh (at most 0.2 s later)
+    eq(C.ns.store.byKey["103:0"].state, "scored", "robe scored")
     eq(C.rowNames(), "Heavy Boots,Lionheart Helm,Bandit's Cloak of the Bear,Robe of Frost", "by % per gold")
     ok(C.hasText("^6 gear items, 4 upgrades, 0 pending$"), "count line")
 end)
@@ -514,15 +525,21 @@ test("more results: scored under the batch limit, scrollable", function()
     local before = C.calls.ScoreItem
     C.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
     C.advance(0.2)
+    local refreshes = 0
+    local refresh = C.ns.Panel.Refresh
+    C.ns.Panel.Refresh = function(...) refreshes = refreshes + 1; return refresh(...) end
     local perBatch = {}
     for _ = 1, 8 do
         local n = C.calls.ScoreItem
         C.step()
         perBatch[#perBatch + 1] = C.calls.ScoreItem - n
     end
+    C.ns.Panel.Refresh = refresh
+    ok(refreshes <= 3, "list rebuilt at most about 5 times a second while scoring: " .. refreshes .. " in 0.4 s")
     for _, n in ipairs(perBatch) do ok(n <= 20, "at most 20 scores per batch: " .. table.concat(perBatch, ",")) end
     C.advance(0.5)
     eq(C.calls.ScoreItem - before, 60, "the 60 new rows scored once each")
+    eq(C.updaters(), 0, "nothing pending: work loop stopped")
     ok(C.hasText("^66 gear items, 64 upgrades, 0 pending %(more results not loaded%)$"), "count line")
     eq(#C.shownRows(), 20, "20 rows shown")
     eq(C.shownRows()[1].cells.name.text, "Heavy Boots", "top before scrolling")
@@ -546,7 +563,7 @@ end)
 test("row tooltip, search click, shift-click link", function()
     local b = C.shownRows()[1]
     b.scripts.OnEnter(b)
-    ok(G.GameTooltip.owner == b and G.GameTooltip.link == C.ns.store.byKey["104:0:60"].link, "tooltip shows the link")
+    ok(G.GameTooltip.owner == b and G.GameTooltip.link == C.ns.store.byKey["104:0"].link, "tooltip shows the link")
     b.scripts.OnLeave(b)
 
     -- The cloak: searched by its base name.
@@ -558,7 +575,7 @@ test("row tooltip, search click, shift-click link", function()
     C.shift = true
     C.chatOpen = true
     click(b)
-    eq(C.inserted, C.ns.store.byKey["104:0:60"].link, "link inserted into chat")
+    eq(C.inserted, C.ns.store.byKey["104:0"].link, "link inserted into chat")
     C.chatOpen = false
     local n = #C.printed
     click(b)
@@ -592,11 +609,11 @@ test("SGJ not ready: rows wait, then score", function()
     for _, fn in ipairs(C.sgjCallbacks) do fn() end
     C.advance(0.5)
     ok(C.hasText("^Waiting for Sharpie's Gear Judge"), "waiting line")
-    eq(C.ns.store.byKey["101:0:60"].state, "pending", "pending")
+    eq(C.ns.store.byKey["101:0"].state, "pending", "pending")
     C.ready = true
     for _, fn in ipairs(C.sgjCallbacks) do fn() end
     C.advance(1)
-    eq(C.ns.store.byKey["101:0:60"].state, "scored", "scored once ready")
+    eq(C.ns.store.byKey["101:0"].state, "scored", "scored once ready")
 end)
 
 test("slash commands", function()
@@ -605,15 +622,15 @@ test("slash commands", function()
     ok(C.printedSince(n, "Sharpie's Gear Judge: loaded, ready yes, version 1, 3.2.7, spec Retribution: Raid"), "SGJ line")
     ok(C.printedSince(n, "SGJ API: IsReady ok, ScoreItem ok, RegisterCallback ok, GetSpec ok, GetVersion ok; "
         .. "SCORES_CHANGED registered yes"), "API line")
-    ok(C.printedSince(n, "Auction house: open; last browse results 71 %(all loaded: no%)"), "browse line")
+    ok(C.printedSince(n, "Auction house: open; last browse results 72 %(all loaded: no%)"), "browse line")
     ok(C.printedSince(n, "Rows: 69 %(gear 66, upgrades 64; scored 65, pending 0 of which resolving 0, unusable 1, "
         .. "error 0, not gear 3%)"), "rows line")
     ok(C.printedSince(n, "sort %% per gold descending"), "panel line")
     n = #C.printed
     C.slash("debug")
     ok(C.printedSince(n, "69 rows"), "debug header")
-    ok(C.printedSince(n, "^.*2%. 102:1200:60 .*Bandit's Cloak of the Bear.* scored price 20000 upgrade 3"), "debug row")
-    ok(C.printedSince(n, "7%. 201:0:60 item:201 notgear %(EQUIP_LOC%)"), "not gear row with reason")
+    ok(C.printedSince(n, "^.*2%. 102:1200 .*Bandit's Cloak of the Bear.* scored price 20000 upgrade 3"), "debug row")
+    ok(C.printedSince(n, "7%. 201:0 item:201 notgear %(EQUIP_LOC%)"), "not gear row with reason")
     local lines = #C.printed - n
     eq(lines, 16, "header and 15 rows")
     n = #C.printed
@@ -676,6 +693,43 @@ test("no errors, no undefined globals read, no stray globals written, no queries
     for k in pairs(C.written) do if not allowed[k] then stray[#stray + 1] = k end end
     table.sort(stray)
     eq(#stray, 0, "stray globals: " .. table.concat(stray, ", "))
+    eq(#C.forbidden, 0, "forbidden auction house calls: " .. table.concat(C.forbidden, ", "))
+end)
+
+---------------------------------------------------------------------------
+-- Session with unreadable (secret) equip locations
+---------------------------------------------------------------------------
+
+local secretItems = {
+    [401] = { name = "Veiled Gloves", equipLoc = "INVTYPE_HANDS", cached = true, secretInstant = true },
+    [402] = { name = "Masked Belt", equipLoc = "INVTYPE_WAIST", cached = true, secretFull = true },
+}
+local S = Client({ items = secretItems, sgj = { [401] = 3, [402] = 2 } })
+
+test("unreadable equip locations are unknown, not 'not gear'", function()
+    S.load()
+    S.fire("ADDON_LOADED", "AuctionJudge")
+    S.openAH()
+    S.results = { result(401, 10000), result(402, 10000) }
+    S.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    S.advance(0.5)
+    local store = S.ns.store
+    eq(store.byKey["401:0"].state, "scored", "secret instant equip location: resolved through full item info")
+    local belt = store.byKey["402:0"]
+    eq(belt.state, "pending", "secret full-info equip location: still pending")
+    eq(belt.reason, "EQUIP_LOC_UNKNOWN", "reason")
+    eq(store.info[belt.itemString], nil, "not cached")
+    secretItems[402].secretFull = false
+    S.advance(3)
+    eq(belt.state, "scored", "scored on a retry once readable")
+    eq(S.rowNames(), "Veiled Gloves,Masked Belt", "both listed")
+    S.closeAH()
+    local errs = S.errors()
+    eq(#errs, 0, "errors: " .. table.concat(errs, " / "))
+    local names = {}
+    for k in pairs(S.missing) do names[#names + 1] = k end
+    eq(#names, 0, "undefined globals read: " .. table.concat(names, ", "))
+    eq(#S.forbidden, 0, "forbidden auction house calls")
 end)
 
 ---------------------------------------------------------------------------
@@ -702,6 +756,8 @@ test("without SGJ: the panel says so and lists nothing", function()
     ok(N.printedSince(n, "Sharpie's Gear Judge: not loaded"), "status says so")
     N.slash("debug")
     N.closeAH()
+    eq(N.updaters(), 0, "nothing to work on without SGJ: work loop stopped")
+    eq(#N.forbidden, 0, "forbidden auction house calls")
     local errs = N.errors()
     eq(#errs, 0, "errors: " .. table.concat(errs, " / "))
     local names = {}

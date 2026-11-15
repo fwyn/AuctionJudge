@@ -5,15 +5,16 @@ local ADDON, ns = ...
 local M, Game, Panel = ns.Model, ns.Game, ns.Panel
 
 local PREFIX = "|cff33ccffAuctionJudge|r: "
-local READ_DELAY = 0.2 -- debounce for browse result events
+local READ_DELAY = 0.2       -- debounce for browse result events
+local REFRESH_INTERVAL = 0.2 -- the list is rebuilt and sorted at most 5 times a second while work goes on
 local DEFAULTS = { shown = true, upgradesOnly = true, hideUnusable = true, sortColumn = "value", sortDesc = true }
 
 local store = M.NewStore()
 ns.store = store
 
 local open = false
-local readAt, nextBatchAt, dirty = nil, 0, false
-local instant = {}       -- itemID -> equip location from GetItemInfoInstant, false when unknown
+local readAt, nextBatchAt, nextRefreshAt, dirty = nil, 0, 0, false
+local instant = {}       -- itemID -> equip location from GetItemInfoInstant (known values only)
 local sgjRegistered = false
 local lastReadError
 local specName
@@ -75,11 +76,32 @@ local function refresh()
     Panel.Refresh(buildView())
 end
 
-local function markDirty() dirty = true end
+---------------------------------------------------------------------------
+-- Work loop: OnUpdate only while the auction house is open and there is something to do
+---------------------------------------------------------------------------
 
----------------------------------------------------------------------------
--- Work loop (OnUpdate only while the auction house is open)
----------------------------------------------------------------------------
+local driver = CreateFrame("Frame")
+local running = false
+local onUpdate
+
+local function wake()
+    if open and not running then
+        running = true
+        driver:SetScript("OnUpdate", onUpdate)
+    end
+end
+
+local function sleep()
+    if running then
+        running = false
+        driver:SetScript("OnUpdate", nil)
+    end
+end
+
+local function markDirty()
+    dirty = true
+    wake()
+end
 
 local function readResults()
     local entries, rawOrError = Game.BrowseResults() -- the raw count, or the error text when entries is nil
@@ -92,10 +114,10 @@ local function readResults()
     for _, e in ipairs(entries) do
         local loc = instant[e.itemID]
         if loc == nil then
-            loc = Game.InstantEquipLoc(e.itemID) or false
+            loc = Game.InstantEquipLoc(e.itemID) -- nil: unknown, resolved through full item info
             instant[e.itemID] = loc
         end
-        if loc then e.equipLoc = loc end
+        e.equipLoc = loc
     end
     M.Rebuild(store, entries)
     store.lastCount = raw
@@ -108,11 +130,12 @@ local function work(row, now)
         local info = Game.ItemInfo(row.itemString)
         if not info then
             Game.RequestItem(row.itemID)
-            M.Defer(row, now, "ITEM_INFO")
+            M.Defer(store, row, now, "ITEM_INFO")
             return
         end
-        M.ApplyInfo(store, row, info)
-        if row.state ~= "pending" then return end
+        M.ApplyInfo(store, row, info, now)
+        -- not gear, a cached outcome, or an unknown equip location deferred for a retry
+        if row.state ~= "pending" or not row.info then return end
     end
     local result, reason = Game.Score(row.link)
     M.ApplyScore(store, row, result, reason, now)
@@ -124,8 +147,6 @@ local function processBatch(now)
     for _, row in ipairs(batch) do work(row, now) end
     if #batch > 0 then markDirty() end
 end
-
-local driver = CreateFrame("Frame")
 
 local function tick()
     local now = GetTime()
@@ -141,16 +162,22 @@ local function tick()
         nextBatchAt = now + M.BATCH_INTERVAL
         processBatch(now)
     end
-    if dirty then
+    if dirty and now >= nextRefreshAt then
         dirty = false
+        nextRefreshAt = now + REFRESH_INTERVAL
         refresh()
+    end
+    -- idle: nothing to read, to work on or to draw
+    if not readAt and not dirty and Panel.Exists() and (store.pending <= 0 or not Game.SGJUsable()) then
+        sleep()
     end
 end
 
-local function onUpdate() safe("update", tick) end
+onUpdate = function() safe("update", tick) end
 
 local function scheduleRead()
     if not readAt then readAt = GetTime() + READ_DELAY end
+    wake()
 end
 
 ---------------------------------------------------------------------------
@@ -226,15 +253,14 @@ function handlers.AUCTION_HOUSE_SHOW()
     specName = Game.SGJReady() and Game.SpecName() or nil
     if Panel.Ensure() then Panel.SetVisible(ns.db.shown) end
     Panel.ResetScroll()
-    nextBatchAt = 0
+    nextBatchAt, nextRefreshAt = 0, 0
     scheduleRead()
     markDirty()
-    driver:SetScript("OnUpdate", onUpdate)
 end
 
 function handlers.AUCTION_HOUSE_CLOSED()
     open = false
-    driver:SetScript("OnUpdate", nil)
+    sleep()
     driver:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
     readAt, dirty = nil, false
     M.Clear(store)
@@ -253,7 +279,7 @@ function handlers.AUCTION_HOUSE_BROWSE_RESULTS_ADDED()
 end
 
 function handlers.GET_ITEM_INFO_RECEIVED(itemID)
-    if open then M.InfoArrived(store, itemID) end
+    if open and M.InfoArrived(store, itemID) then wake() end
 end
 
 driver:SetScript("OnEvent", function(_, event, ...)

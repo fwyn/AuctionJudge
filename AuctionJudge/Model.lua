@@ -37,8 +37,9 @@ function M.ItemString(itemID, suffix)
     return format("item:%d", itemID)
 end
 
-function M.RowKey(itemID, suffix, itemLevel)
-    return format("%d:%d:%d", tonumber(itemID) or 0, tonumber(suffix) or 0, tonumber(itemLevel) or 0)
+---One row per item string: item level variants of the same item and suffix share a link and a score.
+function M.RowKey(itemID, suffix)
+    return format("%d:%d", tonumber(itemID) or 0, tonumber(suffix) or 0)
 end
 
 ---Upgrade per gold: upgradePct / (price in gold). Only for a real upgrade and a real price.
@@ -57,16 +58,39 @@ end
 --   unusable  SGJ says this character cannot use it
 --   notgear   not gear (equip location, or SGJ says NOT_EQUIPPABLE)
 --   error     scoring failed, or still pending after MAX_TRIES
+-- store.pending counts pending rows and store.nextDue is no later than the earliest retry, so a batch
+-- costs nothing when there is no work.
+
+local huge = math.huge
 
 function M.NewStore()
     return {
         rows = {},      -- in browse order
         byKey = {},     -- row key -> row
         byItem = {},    -- itemID -> list of rows
-        info = {},      -- item string -> item info (session cache)
+        info = {},      -- item string -> item info with a known equip location (session cache)
         scores = {},    -- link -> { result = r } or { reason = why } (session cache, final outcomes only)
         lastCount = 0,  -- browse results in the last read
+        pending = 0,
+        nextDue = huge,
     }
+end
+
+local function setState(store, row, state)
+    if row.state == "pending" then store.pending = store.pending - 1 end
+    if state == "pending" then store.pending = store.pending + 1 end
+    row.state = state
+end
+
+local function markDue(store, t)
+    if t < store.nextDue then store.nextDue = t end
+end
+
+local function recount(store)
+    local n = 0
+    for _, row in ipairs(store.rows) do if row.state == "pending" then n = n + 1 end end
+    store.pending = n
+    store.nextDue = n > 0 and 0 or huge
 end
 
 ---Forgets the rows (the auction house closed); the session caches stay.
@@ -74,82 +98,99 @@ function M.Clear(store)
     store.rows, store.byKey, store.byItem = {}, {}, {}
     store.lastCount = 0
     store.full = nil
+    recount(store)
 end
 
-local function resetScore(row)
+local function resetScore(store, row)
     row.upgradePct, row.value, row.specName, row.equipped, row.reason = nil, nil, nil, nil, nil
-    row.state, row.tries, row.nextTry = "pending", 0, 0
+    setState(store, row, "pending")
+    row.tries, row.nextTry = 0, 0
+    markDue(store, 0)
 end
 
-local function setScore(row, result, reason)
+local function setScore(store, row, result, reason)
     if result then
         local pct = tonumber(result.upgradePct)
         if pct then
-            row.state, row.reason = "scored", nil
+            setState(store, row, "scored")
+            row.reason = nil
             row.upgradePct = pct
             row.value = M.Value(pct, row.price)
             row.specName = result.specName
             row.equipped = result.equipped == true
         else
             -- SGJ leaves upgradePct nil when the character's score is 0
-            row.state, row.reason = "error", "NO_PERCENT"
+            setState(store, row, "error")
+            row.reason = "NO_PERCENT"
         end
     elseif reason == "NOT_USABLE" then
-        row.state, row.reason = "unusable", reason
+        setState(store, row, "unusable")
+        row.reason = reason
     else -- NOT_EQUIPPABLE
-        row.state, row.reason = "notgear", reason
+        setState(store, row, "notgear")
+        row.reason = reason
     end
 end
 
+---Puts a pending row back for a later try; gives up after MAX_TRIES.
+function M.Defer(store, row, now, reason)
+    row.tries = (row.tries or 0) + 1
+    row.reason = reason
+    if row.tries >= M.MAX_TRIES then
+        setState(store, row, "error")
+        row.reason = "GAVE_UP " .. tostring(reason)
+        return
+    end
+    setState(store, row, "pending")
+    local delay = M.RETRY_BASE * 2 ^ (row.tries - 1)
+    if delay > M.RETRY_MAX then delay = M.RETRY_MAX end
+    row.nextTry = now + delay
+    markDue(store, row.nextTry)
+end
+
 ---Item info arrived for a row (from the game or the cache). Applies a cached score when there is one.
----info: { name, link, quality, icon, equipLoc }
-function M.ApplyInfo(store, row, info)
+---info: { name, link, quality, icon, equipLoc }. equipLoc nil means unknown (unreadable): the row stays
+---pending for a bounded retry and nothing is cached.
+function M.ApplyInfo(store, row, info, now)
+    if info.equipLoc == nil then
+        M.Defer(store, row, now or 0, "EQUIP_LOC_UNKNOWN")
+        return
+    end
     store.info[row.itemString] = info
     row.info = true
     row.name, row.quality, row.icon, row.equipLoc = info.name, info.quality, info.icon, info.equipLoc
     row.link = info.link or row.itemString
     row.sortName = type(info.name) == "string" and info.name:lower() or ""
     if not M.IsGear(info.equipLoc) then
-        row.state, row.reason = "notgear", "EQUIP_LOC"
+        setState(store, row, "notgear")
+        row.reason = "EQUIP_LOC"
         return
     end
     local cached = store.scores[row.link]
     if cached then
-        setScore(row, cached.result, cached.reason)
+        setScore(store, row, cached.result, cached.reason)
     else
-        resetScore(row)
+        resetScore(store, row)
     end
-end
-
----Puts a pending row back for a later try; gives up after MAX_TRIES.
-function M.Defer(row, now, reason)
-    row.tries = (row.tries or 0) + 1
-    row.reason = reason
-    if row.tries >= M.MAX_TRIES then
-        row.state, row.reason = "error", "GAVE_UP " .. tostring(reason)
-        return
-    end
-    row.state = "pending"
-    local delay = M.RETRY_BASE * 2 ^ (row.tries - 1)
-    if delay > M.RETRY_MAX then delay = M.RETRY_MAX end
-    row.nextTry = now + delay
 end
 
 ---Applies what ScoreItem returned: a result table, or nil and a reason.
 function M.ApplyScore(store, row, result, reason, now)
     if result or reason == "NOT_USABLE" or reason == "NOT_EQUIPPABLE" then
-        setScore(row, result, reason)
+        setScore(store, row, result, reason)
         store.scores[row.link] = { result = result, reason = (not result) and reason or nil }
     elseif reason == "NOT_CACHED" or reason == "NOT_READY" then
-        M.Defer(row, now, reason)
+        M.Defer(store, row, now, reason)
     else
-        row.state, row.reason = "error", reason or "ERROR"
+        setState(store, row, "error")
+        row.reason = reason or "ERROR"
     end
 end
 
 ---Rebuilds the rows from browse entries { itemID, itemLevel, itemSuffix, minPrice, totalQuantity,
----equipLoc (optional instant hint) }. One row per item key; the lowest price wins. Rows already known
----keep their state; new rows take item info and scores from the session caches.
+---equipLoc (optional instant hint, nil when unknown) }. One row per item string (item level variants
+---merge); the lowest price wins. Rows already known keep their state; new rows take item info and
+---scores from the session caches.
 function M.Rebuild(store, entries)
     local old = store.byKey
     local rows, byKey, byItem = {}, {}, {}
@@ -157,17 +198,17 @@ function M.Rebuild(store, entries)
         local id = tonumber(e.itemID)
         if id and id > 0 then
             local suffix, ilvl = tonumber(e.itemSuffix) or 0, tonumber(e.itemLevel) or 0
-            local key = M.RowKey(id, suffix, ilvl)
+            local key = M.RowKey(id, suffix)
             local price = tonumber(e.minPrice)
             local row = byKey[key]
             if row then
                 if price and (not row.price or price < row.price) then
-                    row.price, row.quantity = price, tonumber(e.totalQuantity)
+                    row.price, row.quantity, row.itemLevel = price, tonumber(e.totalQuantity), ilvl
                 end
             else
                 row = old[key]
                 if not row then
-                    row = { key = key, itemID = id, suffix = suffix, itemLevel = ilvl,
+                    row = { key = key, itemID = id, suffix = suffix,
                         itemString = M.ItemString(id, suffix), state = "pending", tries = 0, nextTry = 0 }
                     local info = store.info[row.itemString]
                     if info then
@@ -176,7 +217,7 @@ function M.Rebuild(store, entries)
                         row.state, row.reason = "notgear", "EQUIP_LOC"
                     end
                 end
-                row.price, row.quantity = price, tonumber(e.totalQuantity)
+                row.price, row.quantity, row.itemLevel = price, tonumber(e.totalQuantity), ilvl
                 byKey[key] = row
                 rows[#rows + 1] = row
                 local list = byItem[id]
@@ -190,6 +231,7 @@ function M.Rebuild(store, entries)
     end
     store.rows, store.byKey, store.byItem = rows, byKey, byItem
     store.lastCount = #entries
+    recount(store)
 end
 
 ---The client loaded an item: its rows waiting for item info are tried at the next batch.
@@ -200,6 +242,7 @@ function M.InfoArrived(store, itemID)
     for _, row in ipairs(list) do
         if row.state == "pending" and not row.info then row.nextTry = 0; any = true end
     end
+    if any then markDue(store, 0) end
     return any
 end
 
@@ -207,19 +250,28 @@ end
 function M.InvalidateScores(store)
     store.scores = {}
     for _, row in ipairs(store.rows) do
-        if row.info and M.IsGear(row.equipLoc) then resetScore(row) end
+        if row.info and M.IsGear(row.equipLoc) then resetScore(store, row) end
     end
 end
 
----Up to limit pending rows that are due, in browse order.
+---Up to limit pending rows that are due, in browse order. No scan at all when no row is pending or
+---none is due yet.
 function M.NextBatch(store, now, limit)
     local batch = {}
+    if store.pending <= 0 or now < store.nextDue then return batch end
+    local nextDue = huge
     for _, row in ipairs(store.rows) do
-        if row.state == "pending" and (row.nextTry or 0) <= now then
-            batch[#batch + 1] = row
-            if #batch >= limit then break end
+        if row.state == "pending" then
+            local t = row.nextTry or 0
+            if t <= now and #batch < limit then
+                batch[#batch + 1] = row
+            elseif t < nextDue then
+                nextDue = t
+            end
         end
     end
+    -- the batch rows leave the pending state or set their own retry time through Defer
+    store.nextDue = nextDue
     return batch
 end
 
