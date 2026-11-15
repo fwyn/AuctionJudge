@@ -81,6 +81,7 @@ local function buildView()
         full = store.full,
         exact = exactActive(),
         exactDisabled = exactDisabled,
+        scan = { on = db.exact == true, disabled = exactDisabled, capReached = queue.sent >= db.maxQueries },
         list = usable and M.View(store, db) or {},
         opts = db,
     }

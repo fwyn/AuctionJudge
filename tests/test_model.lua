@@ -634,6 +634,26 @@ test("exact view off lists the group rows; rescoring also resets hidden auction 
     eq(store.pending, 1, "the auction row pending")
 end)
 
+test("scan state: why a row is only its starred base score", function()
+    local on = { on = true }
+    local function group(state, qs) return { approximate = true, state = state, query = qs and { state = qs } or nil } end
+    eq(M.ScanState({ approximate = false, state = "scored" }, on), nil, "fixed-stat item: exact")
+    eq(M.ScanState({ isAuction = true, state = "scored" }, on), nil, "auction row: exact")
+    eq(M.ScanState(group("unusable"), on), nil, "unusable group: never scanned, not greyed")
+    eq(M.ScanState(group("notgear"), on), nil, "not gear")
+    eq(M.ScanState(group("scored", "queued"), on), "Waiting to be looked up", "queued")
+    eq(M.ScanState(group("pending"), on), "Waiting to be looked up", "not queued yet")
+    eq(M.ScanState(group("scored", "sent"), on), "Looking up...", "in flight")
+    eq(M.ScanState(group("scored", "failed"), on), "Lookup failed", "failed")
+    eq(M.ScanState(group("scored", "timeout"), on), "Lookup failed", "timed out")
+    eq(M.ScanState(group("scored", "queued"), { on = true, capReached = true }), "Not looked up (limit reached)", "cap")
+    eq(M.ScanState(group("scored", "sent"), { on = true, capReached = true }), "Looking up...", "in flight beats cap")
+    eq(M.ScanState(group("scored", "queued"), { on = false }), "Scan specific items is off", "setting off")
+    eq(M.ScanState(group("scored"), { on = true, disabled = "SendSearchQuery missing" }), "Lookup not available",
+        "search API missing")
+    eq(M.ScanState(group("scored", "resolved"), on), nil, "resolved")
+end)
+
 test("count line", function()
     local store = scoredStore(SPEC)
     M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },

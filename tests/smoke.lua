@@ -22,7 +22,7 @@ local CHECK = { "SetChecked", "GetChecked" }
 local BACKDROP = { "SetBackdrop", "SetBackdropColor", "SetBackdropBorderColor" }
 local METHODS = {
     Texture = { "SetPoint", "SetAllPoints", "SetSize", "SetWidth", "SetHeight", "SetTexture", "SetColorTexture",
-        "SetTexCoord", "SetBlendMode", "Show", "Hide", "SetShown", "SetAlpha" },
+        "SetTexCoord", "SetBlendMode", "Show", "Hide", "SetShown", "SetAlpha", "SetDesaturated" },
     FontString = { "SetPoint", "SetAllPoints", "SetWidth", "SetHeight", "SetText", "GetText", "SetTextColor",
         "SetJustifyH", "SetJustifyV", "SetWordWrap", "SetFontObject", "Show", "Hide", "SetShown" },
     GameTooltip = { "SetOwner", "SetHyperlink", "Show", "Hide", "AddLine", "ClearLines", "IsShown" },
@@ -97,6 +97,7 @@ local function Client(opts)
             SetHyperlink = function(self, link) self.link = link; self.lines = {} end,
             AddLine = function(self, text) self.lines = self.lines or {}; self.lines[#self.lines + 1] = text end,
             ClearLines = function(self) self.lines = {} end,
+            SetDesaturated = function(self, v) self.desaturated = v and true or false end,
             Enable = function(self) self.disabled = false end,
             Disable = function(self) self.disabled = true end,
         }
@@ -988,10 +989,26 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     clean(X)
 end)
 
+local GREY = "0.6,0.6,0.6"
+local function rgb(c) return table.concat(c, ",") end
+
 test("exact: nothing is searched while the throttle is not ready", function()
     local X = exactSession({ throttle = false, wait = 3 })
     eq(#X.searches, 0, "no searches")
     eq(upgrades(X), "+2.5%*,+3.0%,+2.5%*,+2.5%*", "base scores starred meanwhile")
+    -- rows waiting to be scanned are greyed; the fixed-stat Iron Helm is not
+    local rows = X.shownRows()
+    local g, helm = rows[1], rows[2]
+    eq(rgb(g.cells.name.color) .. " / " .. rgb(g.cells.upgrade.color) .. " / " .. rgb(g.cells.value.color), GREY .. " / "
+        .. GREY .. " / " .. GREY, "group row: name, upgrade, value grey")
+    eq(tostring(g.icon.desaturated), "true", "icon desaturated")
+    eq(g.cells.price.color, nil, "price keeps its colour")
+    eq(rgb(helm.cells.name.color) .. " " .. rgb(helm.cells.upgrade.color) .. " " .. tostring(helm.icon.desaturated),
+        "0.12,1,0 0.1,1,0.1 false", "fixed-stat row: quality colour, green upgrade")
+    g.scripts.OnEnter(g)
+    eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score. Waiting to be looked up", "tooltip reason")
+    helm.scripts.OnEnter(helm)
+    eq(#X.G.GameTooltip.lines, 0, "no extra line for an exact row")
     ok(countLine(X):find(", resolving 0/3$"), "count line: " .. countLine(X))
     local n = #X.printed
     X.slash("status")
@@ -1000,6 +1017,10 @@ test("exact: nothing is searched while the throttle is not ready", function()
     X.fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
     X.advance(3)
     eq(#X.searches, 3, "searches once ready")
+    local first = X.shownRows()[1]
+    eq(first.cells.name.text .. " " .. rgb(first.cells.name.color) .. " " .. tostring(first.icon.desaturated),
+        "Cadet Vest of Healing x2 0.12,1,0 false", "resolved auction rows in normal colours")
+    for _, b in ipairs(X.shownRows()) do eq(b.scanReason, nil, "no row greyed once resolved") end
     X.closeAH()
     clean(X)
 end)
@@ -1014,6 +1035,8 @@ test("exact: browse events hold the queue; a new search cancels it; the cap hold
     eq(#X.searches, 1, "cap: still one search")
     eq(X.updaters(), 0, "capped: idle")
     ok(countLine(X):find(", resolving 1/3$"), "count line: " .. countLine(X))
+    local capped = X.shownRows()[#X.shownRows()]
+    eq(capped.scanReason, "Not looked up (limit reached)", "over the cap: greyed with the reason")
     -- a new search: queue cancelled, the cap starts again
     X.slash("maxqueries 60")
     X.results = { result(501, 50000, WHALE) }
@@ -1158,7 +1181,7 @@ test("exact off: no searches, base scores starred", function()
     eq(countLine(X), "5 gear items, 4 upgrades, 0 pending", "no resolving part")
     local b = X.shownRows()[1]
     b.scripts.OnEnter(b)
-    eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score, exact auctions not read", "tooltip note")
+    eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score. Scan specific items is off", "tooltip note")
     X.slash("exact on")
     X.advance(4)
     eq(#X.searches, 3, "on again: searched")

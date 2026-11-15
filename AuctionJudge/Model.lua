@@ -715,6 +715,23 @@ function M.FormatMoney(copper)
     return format("%dc", c)
 end
 
+---Why a listed row's score is only its group's starred base score, or nil when the row is exact (a
+---fixed-stat item, an auction row, or a group that will not be scored at all: unusable, not gear).
+---ctx: { on = the "Scan specific items" setting, disabled = why searching is off this session,
+---capReached = the queries of this search used up }. Such rows are drawn greyed.
+function M.ScanState(row, ctx)
+    if row.isAuction or not row.approximate then return nil end
+    if row.state == "notgear" or row.state == "unusable" then return nil end
+    if not ctx.on then return "Scan specific items is off" end
+    if ctx.disabled then return "Lookup not available" end
+    local qs = row.query and row.query.state
+    if qs == "resolved" then return nil end
+    if qs == "sent" then return "Looking up..." end
+    if qs == "failed" or qs == "timeout" then return "Lookup failed" end
+    if ctx.capReached then return "Not looked up (limit reached)" end
+    return "Waiting to be looked up"
+end
+
 ---The name shown for a row: "Cadet Vest of the Whale x4" when several auctions of the item were merged.
 function M.DisplayName(row)
     local name = row.name or row.itemString or "?"

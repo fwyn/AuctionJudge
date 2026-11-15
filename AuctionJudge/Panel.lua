@@ -118,11 +118,12 @@ local function makeRow(i)
     end
     b:SetScript("OnEnter", function(self)
         if not self.row then return end
-        local link, approximate = self.row.link, self.row.approximate
+        local link, why = self.row.link, self.scanReason
         pcall(function()
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetHyperlink(link)
-            if approximate then GameTooltip:AddLine("AuctionJudge: * " .. M.APPROXIMATE_NOTE, 1, 0.5, 0.25) end
+            -- why the score is only the starred base score
+            if why then GameTooltip:AddLine("AuctionJudge: * base item score. " .. why, 1, 0.5, 0.25) end
             GameTooltip:Show()
         end)
     end)
@@ -216,19 +217,24 @@ function Panel.Scroll(delta)
     if lastView then Panel.Refresh(lastView) end
 end
 
-local function fill(b, row)
+---Draws a row. A row waiting to be scanned (its score only the starred base score) is greyed: name,
+---icon, upgrade and value; the price keeps its colour.
+local function fill(b, row, scan)
     b.row = row
+    local why = M.ScanState(row, scan or { on = true })
+    b.scanReason = why
     b.icon:SetTexture(row.icon or "Interface\\Icons\\INV_Misc_QuestionMark")
-    local q = M.QUALITY_RGB[row.quality or 1] or M.QUALITY_RGB[1]
+    pcall(function() b.icon:SetDesaturated(why ~= nil) end)
+    local q = why and M.COLOR.dim or M.QUALITY_RGB[row.quality or 1] or M.QUALITY_RGB[1]
     local c = b.cells
     c.name:SetText(M.DisplayName(row))
     c.name:SetTextColor(q[1], q[2], q[3])
     c.price:SetText(Game.CoinText(row.price) .. (row.bid and " bid" or ""))
     local up, key = M.FormatUpgrade(row)
     c.upgrade:SetText(up)
-    color(c.upgrade, key)
+    color(c.upgrade, why and "dim" or key)
     c.value:SetText(M.FormatValue(row.value, row.price))
-    color(c.value, "normal")
+    color(c.value, why and "dim" or "normal")
     b:Show()
 end
 
@@ -274,7 +280,7 @@ function Panel.Refresh(view)
     for i, b in ipairs(rows) do
         local row = list[offset + i]
         if row then
-            fill(b, row)
+            fill(b, row, view.scan)
         else
             b.row = nil
             b:Hide()
