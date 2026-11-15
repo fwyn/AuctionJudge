@@ -92,10 +92,11 @@ local function makeRow(i)
     end
     b:SetScript("OnEnter", function(self)
         if not self.row then return end
-        local link = self.row.link
+        local link, approximate = self.row.link, self.row.approximate
         pcall(function()
             GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
             GameTooltip:SetHyperlink(link)
+            if approximate then GameTooltip:AddLine("AuctionJudge: * " .. M.APPROXIMATE_NOTE, 1, 0.5, 0.25) end
             GameTooltip:Show()
         end)
     end)

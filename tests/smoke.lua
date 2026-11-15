@@ -25,7 +25,8 @@ local METHODS = {
         "SetTexCoord", "SetBlendMode", "Show", "Hide", "SetShown", "SetAlpha" },
     FontString = { "SetPoint", "SetAllPoints", "SetWidth", "SetHeight", "SetText", "GetText", "SetTextColor",
         "SetJustifyH", "SetJustifyV", "SetWordWrap", "SetFontObject", "Show", "Hide", "SetShown" },
-    GameTooltip = { "SetOwner", "SetHyperlink", "Show", "Hide", "AddLine", "ClearLines" },
+    GameTooltip = { "SetOwner", "SetHyperlink", "Show", "Hide", "AddLine", "ClearLines", "SetItemKey", "GetItem",
+        "IsShown" },
 }
 
 local function concat(...)
@@ -94,7 +95,13 @@ local function Client(opts)
             UnregisterEvent = function(self, e) self.events[e] = nil end,
             SetBackdrop = function(self, b) self.backdrop = b end,
             SetOwner = function(self, owner) self.owner = owner end,
-            SetHyperlink = function(self, link) self.link = link end,
+            SetHyperlink = function(self, link) self.link = link; self.lines = {} end,
+            AddLine = function(self, text) self.lines = self.lines or {}; self.lines[#self.lines + 1] = text end,
+            SetItemKey = function(self, id, ilvl, suffix) self.itemKey = { id, ilvl, suffix } end,
+            GetItem = function(self)
+                if opts.noScan or not self.itemKey then return nil end
+                return C.keyLink(self.itemKey[1], self.itemKey[3])
+            end,
         }
         setmetatable(w, { __index = function(_, k)
             if allowed[k] then return impl[k] or function() end end
@@ -109,7 +116,8 @@ local function Client(opts)
 
     -- Items: id -> { name, quality, equipLoc, cached }. Suffix names by suffix id.
     local items = opts.items
-    local suffixes = { [1200] = " of the Bear" }
+    local suffixes = { [1200] = " of the Bear", [1001] = " of Healing", [1002] = " of the Whale",
+        [1003] = " of Intellect" }
     C.items, C.requested = items, {}
 
     local function parse(s)
@@ -122,15 +130,28 @@ local function Client(opts)
     end
     C.parse = parse
 
+    -- The real (suffixed) name and link of an item key.
+    function C.keyLink(id, suffix)
+        local it = items[id]
+        local name = it.name .. (suffix ~= 0 and (suffixes[suffix] or "") or "")
+        local istr = suffix ~= 0 and ("item:" .. id .. "::::::" .. suffix) or ("item:" .. id)
+        return name, "|cff1eff00|H" .. istr .. "::::::::60:::::|h[" .. name .. "]|h|r"
+    end
+
+    -- As seen in the game: a constructed item string with a suffix resolves to the base item; a full
+    -- hyperlink keeps its suffix.
     local function getItemInfo(s)
         count("GetItemInfo")
         local id, suffix
         if type(s) == "number" then id, suffix = s, 0 else id, suffix = parse(s) end
         local it = id and items[id]
         if not it or not it.cached then return nil end
-        local name = it.name .. (suffix ~= 0 and (suffixes[suffix] or "") or "")
-        local istr = suffix ~= 0 and ("item:" .. id .. "::::::" .. suffix) or ("item:" .. id)
-        local link = "|cff1eff00|H" .. istr .. "::::::::60:::::|h[" .. name .. "]|h|r"
+        local name, link
+        if type(s) == "string" and s:find("|H", 1, true) then
+            name, link = C.keyLink(id, suffix)
+        else
+            name, link = C.keyLink(id, 0)
+        end
         local loc = it.secretFull and C.SECRET or it.equipLoc
         return name, link, it.quality or 2, 60, 55, "Armor", "Plate", 1, loc, "icon" .. id
     end
@@ -147,6 +168,16 @@ local function Client(opts)
     G.C_Timer = { After = function(d, fn) C.timers[#C.timers + 1] = { at = C.clock + d, fn = fn } end }
     G.CreateFrame = function(kind, _, parent, template) return widget(kind, parent, template) end
     G.UIParent = widget("Frame")
+    G.WorldFrame = widget("Frame")
+    if not opts.noKeyTooltip then
+        G.C_TooltipInfo = { GetItemKey = function(id, ilvl, suffix)
+            count("GetItemKeyTooltip")
+            local it = items[id]
+            if not it or not it.cached then return nil end
+            local _, link = C.keyLink(id, suffix)
+            return { type = 0, hyperlink = link, lines = {} }
+        end }
+    end
     G.SlashCmdList = {}
     G.BackdropTemplateMixin = {}
     G.GameTooltip = widget("GameTooltip")
@@ -187,6 +218,16 @@ local function Client(opts)
             return out
         end,
         HasFullBrowseResults = function() return C.full end,
+        MakeItemKey = function(id, ilvl, suffix)
+            return { itemID = id, itemLevel = ilvl or 0, itemSuffix = suffix or 0, battlePetSpeciesID = 0 }
+        end,
+        GetItemKeyInfo = function(key)
+            local it = items[key.itemID]
+            if not it or not it.cached or it.keyInfoLoaded == false then return nil end
+            local name = C.keyLink(key.itemID, key.itemSuffix or 0)
+            return { itemID = key.itemID, itemName = name, quality = it.quality or 2, iconFileID = "icon" .. key.itemID,
+                isEquipment = it.equipLoc ~= "", isCommodity = false, isPet = false }
+        end,
         SendBrowseQuery = forbidden("SendBrowseQuery"),
         RequestMoreBrowseResults = forbidden("RequestMoreBrowseResults"),
         PlaceBid = forbidden("PlaceBid"),
@@ -214,11 +255,14 @@ local function Client(opts)
                 C.scoredLinks[#C.scoredLinks + 1] = link
                 if not C.ready then return nil, "NOT_READY" end
                 if type(link) ~= "string" or not link:find("item:%-?%d+") then return nil, "BAD_LINK" end
-                local name, _, _, _, _, _, _, _, equipLoc = getItemInfo(link)
+                -- like SGJ: GetItemInfo(link), and the returned link is the one judged
+                local name, fullLink, _, _, _, _, _, _, equipLoc = getItemInfo(link)
                 if not name then return nil, "NOT_CACHED" end
+                link = fullLink or link
                 if equipLoc == "" then return nil, "NOT_EQUIPPABLE" end
-                local id = parse(link)
-                local p = pct[id]
+                local id, suffix = parse(link)
+                local p = pct[id .. ":" .. suffix]
+                if p == nil then p = pct[id] end
                 if p == "NOT_USABLE" then return nil, "NOT_USABLE" end
                 if p == nil then return nil, "ERROR" end
                 return { upgradePct = p * C.factor, upgrade = p * 5, itemScore = 50, equippedScore = 40, slot = 5,
@@ -228,6 +272,7 @@ local function Client(opts)
     end
 
     local OPTIONAL = { "^AuctionJudgeDB$", "^AuctionHouseFrame$", "^ChatFrameUtil$", "^SharpiesGearJudgeAPI$" }
+    if opts.noKeyTooltip then OPTIONAL[#OPTIONAL + 1] = "^C_TooltipInfo$" end
     setmetatable(G, {
         __index = function(_, k)
             local optional = false
@@ -627,6 +672,8 @@ test("slash commands", function()
     ok(C.printedSince(n, "Rows: 69 %(gear 66, upgrades 64; scored 65, pending 0 of which resolving 0, unusable 1, "
         .. "error 0, not gear 3%)"), "rows line")
     ok(C.printedSince(n, "sort Value descending"), "panel line")
+    ok(C.printedSince(n, "Links: key tooltip 66, scan tooltip 0, item info 0; 0 suffixed rows judged as the base item"),
+        "link sources")
     n = #C.printed
     C.slash("debug")
     ok(C.printedSince(n, "69 rows"), "debug header")
@@ -639,8 +686,8 @@ test("slash commands", function()
     ok(C.printedSince(n, "1 of 69 rows match \"CLOAK\":"), "debug lookup header")
     ok(C.printedSince(n, "102:1200 Bandit's Cloak of the Bear: scored; upgrade 3, item 50 vs equipped 40 %(slot 5%); "
         .. "price 20000, value 1.5; shown"), "debug lookup row")
-    ok(C.printedSince(n, "id 102 suffix 1200 ilvl 60, item:102::::::1200, INVTYPE_CLOAK, link |cff1eff00|Hitem:102"),
-        "debug lookup second line")
+    ok(C.printedSince(n, "id 102 suffix 1200 ilvl 60, item:102::::::1200, INVTYPE_CLOAK, link %(keytooltip%) "
+        .. "|cff1eff00|Hitem:102::::::1200:.*, SGJ judged |cff1eff00|Hitem:102::::::1200:"), "debug lookup second line")
     n = #C.printed
     C.slash("debug item:201")
     ok(C.printedSince(n, "201:0 %-: notgear %(EQUIP_LOC%).*hidden: not gear"), "hidden not-gear row (no name: found by item string)")
@@ -774,6 +821,112 @@ test("unreadable equip locations are unknown, not 'not gear'", function()
     for k in pairs(S.missing) do names[#names + 1] = k end
     eq(#names, 0, "undefined globals read: " .. table.concat(names, ", "))
     eq(#S.forbidden, 0, "forbidden auction house calls")
+end)
+
+---------------------------------------------------------------------------
+-- Random suffix items: "Cadet Vest of ..." (GetItemInfo of a suffixed item string gives the base item)
+---------------------------------------------------------------------------
+
+-- 1% at 4s49c, 4% at 5g, 6% at 15g50s; the base item would be 2.5%.
+local CADET_PCT = { [501] = 2.5, ["501:1001"] = 1, ["501:1002"] = 4, ["501:1003"] = 6 }
+
+local function cadet(copts)
+    local list = { [501] = { name = "Cadet Vest", quality = 2, equipLoc = "INVTYPE_CHEST", cached = true } }
+    if copts.keyInfoLate then list[501].keyInfoLoaded = false end
+    local X = Client({ items = list, sgj = CADET_PCT, noKeyTooltip = copts.noKeyTooltip, noScan = copts.noScan })
+    X.load()
+    X.fire("ADDON_LOADED", "AuctionJudge")
+    X.openAH()
+    X.results = { result(501, 449, 1001), result(501, 50000, 1002), result(501, 155000, 1003) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.advance(0.6)
+    return X, list
+end
+
+local function upgrades(X)
+    local out = {}
+    for i, b in ipairs(X.shownRows()) do out[i] = b.cells.upgrade.text end
+    return table.concat(out, ",")
+end
+
+local function clean(X)
+    local errs = X.errors()
+    eq(#errs, 0, "errors: " .. table.concat(errs, " / "))
+    local names = {}
+    for k in pairs(X.missing) do names[#names + 1] = k end
+    eq(#names, 0, "undefined globals read: " .. table.concat(names, ", "))
+    eq(#X.forbidden, 0, "forbidden auction house calls: " .. table.concat(X.forbidden, ", "))
+end
+
+test("random suffixes: real names and links from the item key, distinct scores (key tooltip)", function()
+    local X = cadet({})
+    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of the Whale,Cadet Vest of Intellect", "distinct names")
+    eq(upgrades(X), "+1.0%,+4.0%,+6.0%", "distinct scores, none marked")
+    local seen = {}
+    for _, row in ipairs(X.ns.store.rows) do
+        eq(row.linkSource, "keytooltip", "source")
+        ok(row.link:find("item:501::::::" .. row.suffix .. ":", 1, true), "link carries the suffix: " .. row.link)
+        ok(row.sgjLink:find("item:501::::::" .. row.suffix .. ":", 1, true), "SGJ judged the suffixed link")
+        ok(not seen[row.link], "links distinct")
+        seen[row.link] = true
+        ok(X.ns.store.scores[row.link], "score cached per suffixed link")
+    end
+    for _, l in ipairs(X.scoredLinks) do ok(l:find("|H", 1, true), "SGJ got a hyperlink, not the item string: " .. l) end
+    X.closeAH()
+    eq(X.G.AuctionJudgeDB.lastDump.rows[1].linkSource, "keytooltip", "source in the dump")
+    eq(X.G.AuctionJudgeDB.lastDump.linkSources.keytooltip, 3, "source counts in the dump")
+    clean(X)
+end)
+
+test("random suffixes without C_TooltipInfo: the private scan tooltip gives the link", function()
+    local X = cadet({ noKeyTooltip = true })
+    eq(upgrades(X), "+1.0%,+4.0%,+6.0%", "distinct scores")
+    eq(X.ns.store.rows[1].linkSource, "scantooltip", "source")
+    local tips = {}
+    for _, w in ipairs(X.widgets) do if rawget(w, "template") == "GameTooltipTemplate" then tips[#tips + 1] = w end end
+    eq(#tips, 1, "one scan tooltip")
+    eq(tips[1].shown, false, "never left shown")
+    ok(tips[1].owner == X.G.WorldFrame, "owned by WorldFrame")
+    local n = #X.printed
+    X.slash("status")
+    ok(X.printedSince(n, "Links: key tooltip 0, scan tooltip 3, item info 0; 0 suffixed"), "status counts per source")
+    X.closeAH()
+    clean(X)
+end)
+
+test("random suffixes with neither tooltip: waits for item key info, then marks base scores with *", function()
+    local X, list = cadet({ noKeyTooltip = true, noScan = true, keyInfoLate = true })
+    ok(X.G.AuctionJudgeDB and #X.shownRows() == 0, "nothing listed while waiting")
+    eq(X.ns.store.rows[1].reason, "ITEM_KEY_INFO", "waiting for item key info")
+    local driver
+    for _, w in ipairs(X.widgets) do if w.events.ITEM_KEY_ITEM_INFO_RECEIVED then driver = w end end
+    ok(driver, "ITEM_KEY_ITEM_INFO_RECEIVED registered")
+    list[501].keyInfoLoaded = true
+    X.fire("ITEM_KEY_ITEM_INFO_RECEIVED", 501)
+    X.advance(0.5)
+    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of the Whale,Cadet Vest of Intellect", "names from item key info")
+    eq(upgrades(X), "+2.5%*,+2.5%*,+2.5%*", "base scores marked")
+    local row = X.ns.store.rows[1]
+    eq(row.linkSource .. " " .. tostring(row.approximate), "iteminfo true", "fallback recorded")
+    eq(X.ns.store.info[row.itemString], nil, "approximate info not cached")
+    local b = X.shownRows()[1]
+    b.scripts.OnEnter(b)
+    eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score, suffix not resolved", "tooltip note")
+    local n = #X.printed
+    X.slash("debug healing")
+    ok(X.printedSince(n, "link %(iteminfo%).*; base item score, suffix not resolved"), "debug note")
+    X.closeAH()
+    eq(X.G.AuctionJudgeDB.lastDump.rows[1].approximate, true, "dump marks it")
+    clean(X)
+end)
+
+test("random suffix whose item key info never arrives: base name, marked, after a bounded wait", function()
+    local X = cadet({ noKeyTooltip = true, noScan = true, keyInfoLate = true })
+    X.advance(5)
+    eq(X.rowNames(), "Cadet Vest,Cadet Vest,Cadet Vest", "base names")
+    eq(upgrades(X), "+2.5%*,+2.5%*,+2.5%*", "marked")
+    X.closeAH()
+    clean(X)
 end)
 
 ---------------------------------------------------------------------------

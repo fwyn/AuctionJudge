@@ -144,6 +144,82 @@ function Game.ItemInfo(itemString)
     }
 end
 
+---------------------------------------------------------------------------
+-- Item keys: the real (random suffix) name and link, the way the Blizzard list gets them. No queries.
+---------------------------------------------------------------------------
+
+local function makeItemKey(itemID, itemLevel, itemSuffix)
+    local AH = C_AuctionHouse
+    if type(AH) == "table" and type(AH.MakeItemKey) == "function" then
+        local ok, key = pcall(AH.MakeItemKey, itemID, itemLevel, itemSuffix)
+        if ok and type(key) == "table" then return key end
+    end
+    return { itemID = itemID, itemLevel = itemLevel or 0, itemSuffix = itemSuffix or 0, battlePetSpeciesID = 0 }
+end
+
+---{ name, quality, icon } from C_AuctionHouse.GetItemKeyInfo, or nil until the client has it
+---(ITEM_KEY_ITEM_INFO_RECEIVED follows).
+function Game.ItemKeyInfo(itemID, itemLevel, itemSuffix)
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.GetItemKeyInfo) ~= "function" then return nil end
+    local ok, info = pcall(AH.GetItemKeyInfo, makeItemKey(itemID, itemLevel, itemSuffix))
+    if not ok or type(info) ~= "table" or isSecret(info) then return nil end
+    local ok2, out = pcall(function()
+        local name, quality, icon = plain(info.itemName), plain(info.quality), plain(info.iconFileID)
+        return {
+            name = type(name) == "string" and name ~= "" and name or nil,
+            quality = type(quality) == "number" and quality or nil,
+            icon = (type(icon) == "number" or type(icon) == "string") and icon or nil,
+        }
+    end)
+    if not ok2 or not out.name then return nil end
+    return out
+end
+
+---A readable link string for this item id, or nil.
+local function checkLink(link, itemID)
+    link = plain(link)
+    if type(link) ~= "string" then return nil end
+    local id = link:match("item:(%-?%d+)")
+    if not id or tonumber(id) ~= itemID then return nil end
+    return link
+end
+
+local scanTip -- false once creating it failed
+local function scanTooltip()
+    if scanTip == nil then
+        local ok, tip = pcall(CreateFrame, "GameTooltip", "AuctionJudgeScanTooltip", nil, "GameTooltipTemplate")
+        scanTip = ok and tip or false
+    end
+    return scanTip or nil
+end
+
+---The item key's link and where it came from ("keytooltip", "scantooltip"), or nil.
+function Game.KeyLink(itemID, itemLevel, itemSuffix)
+    itemLevel, itemSuffix = itemLevel or 0, itemSuffix or 0
+    local TI = C_TooltipInfo
+    if type(TI) == "table" and type(TI.GetItemKey) == "function" then
+        local ok, data = pcall(TI.GetItemKey, itemID, itemLevel, itemSuffix)
+        if ok and type(data) == "table" and not isSecret(data) then
+            local ok2, link = pcall(function() return checkLink(data.hyperlink, itemID) end)
+            if ok2 and link then return link, "keytooltip" end
+        end
+    end
+    local tip = scanTooltip()
+    if tip then
+        local ok, link = pcall(function()
+            tip:SetOwner(WorldFrame or UIParent, "ANCHOR_NONE")
+            tip:ClearLines()
+            tip:SetItemKey(itemID, itemLevel, itemSuffix)
+            local _, l = tip:GetItem()
+            tip:Hide()
+            return checkLink(l, itemID)
+        end)
+        if ok and link then return link, "scantooltip" end
+    end
+    return nil
+end
+
 ---The item's base name (without a random suffix), for searching.
 function Game.BaseName(itemID)
     local f = C_Item and C_Item.GetItemNameByID

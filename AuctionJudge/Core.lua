@@ -126,15 +126,26 @@ local function readResults()
     markDirty()
 end
 
+local KEY_WAITS = 2 -- tries a suffixed row waits for item key info when no key link is readable
+
 local function work(row, now)
     if not row.info then
-        local info = Game.ItemInfo(row.itemString)
-        if not info then
+        local base = Game.ItemInfo(row.itemString)
+        if not base then
             Game.RequestItem(row.itemID)
             M.Defer(store, row, now, "ITEM_INFO")
             return
         end
-        M.ApplyInfo(store, row, info, now)
+        -- the real name and link come from the item key: GetItemInfo of a suffixed item string can give
+        -- the base item
+        local keyInfo = Game.ItemKeyInfo(row.itemID, row.itemLevel, row.suffix)
+        local keyLink, source = Game.KeyLink(row.itemID, row.itemLevel, row.suffix)
+        if not keyLink and not keyInfo and row.suffix ~= 0 and (row.keyWaits or 0) < KEY_WAITS then
+            row.keyWaits = (row.keyWaits or 0) + 1
+            M.Defer(store, row, now, "ITEM_KEY_INFO")
+            return
+        end
+        M.ApplyInfo(store, row, M.MergeInfo(base, keyInfo, keyLink, source, row.suffix), now)
         -- not gear, a cached outcome, or an unknown equip location deferred for a retry
         if row.state ~= "pending" or not row.info then return end
     end
@@ -251,6 +262,7 @@ function handlers.AUCTION_HOUSE_SHOW()
     open = true
     registerSGJ()
     driver:RegisterEvent("GET_ITEM_INFO_RECEIVED")
+    pcall(driver.RegisterEvent, driver, "ITEM_KEY_ITEM_INFO_RECEIVED") -- may not exist on this client
     specName = Game.SGJReady() and Game.SpecName() or nil
     if Panel.Ensure() then Panel.SetVisible(ns.db.shown) end
     Panel.ResetScroll()
@@ -282,6 +294,7 @@ function handlers.AUCTION_HOUSE_CLOSED()
     open = false
     sleep()
     driver:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
+    pcall(driver.UnregisterEvent, driver, "ITEM_KEY_ITEM_INFO_RECEIVED")
     readAt, dirty = nil, false
     M.Clear(store)
     Panel.SetVisible(false)
@@ -301,6 +314,7 @@ end
 function handlers.GET_ITEM_INFO_RECEIVED(itemID)
     if open and M.InfoArrived(store, itemID) then wake() end
 end
+handlers.ITEM_KEY_ITEM_INFO_RECEIVED = handlers.GET_ITEM_INFO_RECEIVED
 
 driver:SetScript("OnEvent", function(_, event, ...)
     local fn = handlers[event]
@@ -354,6 +368,12 @@ local function status()
     ns.Print(string.format("Rows: %d (gear %d, upgrades %d; scored %d, pending %d of which resolving %d, unusable %d, "
         .. "error %d, not gear %d); %d scores cached", c.total, c.gear, c.upgrades, c.scored, c.pending, c.resolving,
         c.unusable, c.error, c.notgear, cached))
+    local sources = M.LinkSourceCounts(store)
+    local approx = 0
+    for _, row in ipairs(store.rows) do if row.approximate then approx = approx + 1 end end
+    ns.Print(string.format("Links: key tooltip %d, scan tooltip %d, item info %d; %d suffixed rows judged as the base "
+        .. "item (*); C_TooltipInfo.GetItemKey %s", sources.keytooltip or 0, sources.scantooltip or 0,
+        sources.iteminfo or 0, approx, yesno(type(C_TooltipInfo) == "table" and C_TooltipInfo.GetItemKey)))
     local db = ns.db
     ns.Print(string.format("Panel: %s, %s; upgrades only %s, hide unusable %s, sort %s",
         Panel.Exists() and "created" or "not created", db.shown and "on" or "off", yesno(db.upgradesOnly),

@@ -106,7 +106,7 @@ end
 
 local function resetScore(store, row)
     row.upgradePct, row.value, row.specName, row.equipped, row.reason = nil, nil, nil, nil, nil
-    row.itemScore, row.equippedScore, row.slot, row.sgjReason = nil, nil, nil, nil
+    row.itemScore, row.equippedScore, row.slot, row.sgjReason, row.sgjLink = nil, nil, nil, nil, nil
     setState(store, row, "pending")
     row.tries, row.nextTry = 0, 0
     markDue(store, 0)
@@ -118,6 +118,8 @@ local function setScore(store, row, result, reason)
         -- plain numbers only (kept for diagnostics)
         row.itemScore, row.equippedScore, row.slot =
             tonumber(result.itemScore), tonumber(result.equippedScore), tonumber(result.slot)
+        -- the link SGJ judged (it normalises through GetItemInfo): shows whether the suffix survived
+        row.sgjLink = type(result.itemLink) == "string" and result.itemLink or nil
         local pct = tonumber(result.upgradePct)
         if pct then
             setState(store, row, "scored")
@@ -156,6 +158,44 @@ function M.Defer(store, row, now, reason)
     markDue(store, row.nextTry)
 end
 
+---The name inside a hyperlink ("|h[Cadet Vest of the Whale]|h"), or nil.
+function M.LinkName(link)
+    if type(link) ~= "string" then return nil end
+    local name = link:match("|h%[(.-)%]|h")
+    if name and name ~= "" then return name end
+    return nil
+end
+
+---Row info from the base item info (GetItemInfo of the item string: equip location; for a random suffix
+---item possibly only the base item's name and link), the item key info ({ name, quality, icon } or nil)
+---and the link read from the item key (or nil) with its source. Without a key link a suffixed row is
+---approximate: its score is the base item's.
+function M.MergeInfo(base, keyInfo, keyLink, keySource, suffix)
+    keyInfo = keyInfo or {}
+    local link = keyLink or base.link
+    return {
+        name = keyInfo.name or M.LinkName(keyLink) or base.name,
+        link = link,
+        linkSource = keyLink and keySource or "iteminfo",
+        quality = keyInfo.quality or base.quality,
+        icon = keyInfo.icon or base.icon,
+        equipLoc = base.equipLoc,
+        approximate = (tonumber(suffix) or 0) ~= 0 and keyLink == nil,
+    }
+end
+
+---Rows per link source ("keytooltip", "scantooltip", "iteminfo"), resolved rows only.
+function M.LinkSourceCounts(store)
+    local c = {}
+    for _, row in ipairs(store.rows) do
+        if row.info then
+            local s = row.linkSource or "iteminfo"
+            c[s] = (c[s] or 0) + 1
+        end
+    end
+    return c
+end
+
 ---Item info arrived for a row (from the game or the cache). Applies a cached score when there is one.
 ---info: { name, link, quality, icon, equipLoc }. equipLoc nil means unknown (unreadable): the row stays
 ---pending for a bounded retry and nothing is cached.
@@ -164,10 +204,13 @@ function M.ApplyInfo(store, row, info, now)
         M.Defer(store, row, now or 0, "EQUIP_LOC_UNKNOWN")
         return
     end
-    store.info[row.itemString] = info
+    -- an approximate (base item) link is not kept: a later read may get the real one
+    if not info.approximate then store.info[row.itemString] = info end
     row.info = true
     row.name, row.quality, row.icon, row.equipLoc = info.name, info.quality, info.icon, info.equipLoc
     row.link = info.link or row.itemString
+    row.linkSource = info.linkSource or "iteminfo"
+    row.approximate = info.approximate == true
     row.sortName = type(info.name) == "string" and info.name:lower() or ""
     if not M.IsGear(info.equipLoc) then
         setState(store, row, "notgear")
@@ -374,8 +417,11 @@ function M.DumpRow(row, opts)
         state = row.state, reason = row.reason, sgjReason = row.sgjReason,
         upgradePct = row.upgradePct, itemScore = row.itemScore, equippedScore = row.equippedScore, slot = row.slot,
         price = row.price, value = row.value, shown = hidden == nil, hiddenBy = hidden,
+        linkSource = row.linkSource, approximate = row.approximate == true, sgjLink = row.sgjLink,
     }
 end
+
+M.APPROXIMATE_NOTE = "base item score, suffix not resolved"
 
 ---Rows whose name (or item string) contains text, case-insensitive.
 function M.FindRows(store, text)
@@ -409,6 +455,7 @@ function M.Dump(store, opts)
         counts = M.Counts(store),
         rawCount = store.lastCount, full = store.full, rowCount = #store.rows,
         rows = rows, skipped = skipped, skippedCount = store.skippedCount or 0,
+        linkSources = M.LinkSourceCounts(store),
     }
 end
 
@@ -420,8 +467,9 @@ function M.DebugLines(d)
             d.key, v(d.name), d.state, d.reason and (" (" .. d.reason .. ")") or "",
             d.sgjReason and (" SGJ " .. d.sgjReason) or "", v(d.upgradePct), v(d.itemScore), v(d.equippedScore),
             v(d.slot), v(d.price), v(d.value), d.shown and "shown" or ("hidden: " .. d.hiddenBy)),
-        format("    id %s suffix %s ilvl %s, %s, %s, link %s", v(d.itemID), v(d.itemSuffix), v(d.itemLevel),
-            v(d.itemString), v(d.equipLoc), v(d.link))
+        format("    id %s suffix %s ilvl %s, %s, %s, link (%s) %s, SGJ judged %s%s", v(d.itemID), v(d.itemSuffix),
+            v(d.itemLevel), v(d.itemString), v(d.equipLoc), v(d.linkSource), v(d.link), v(d.sgjLink),
+            d.approximate and ("; " .. M.APPROXIMATE_NOTE) or "")
 end
 
 local RANK = { scored = 0, pending = 1, error = 2, unusable = 3 }
@@ -511,7 +559,9 @@ end
 function M.FormatUpgrade(row)
     local s = row.state
     if s == "scored" then
-        return format("%+.1f%%", row.upgradePct), row.upgradePct > 0 and "good" or "dim"
+        -- "*": a random suffix item judged as its base item
+        return format("%+.1f%%", row.upgradePct) .. (row.approximate and "*" or ""),
+            row.upgradePct > 0 and "good" or "dim"
     elseif s == "pending" then
         return "...", "dim"
     elseif s == "unusable" then
