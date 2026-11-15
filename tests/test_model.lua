@@ -1,0 +1,367 @@
+-- Unit tests of the pure model (Model.lua).
+local H = ...
+local test, eq, ok, near = H.test, H.eq, H.ok, H.near
+
+local ns = {}
+H.load("Model.lua", ns)
+local M = ns.Model
+
+local function info(name, equipLoc, extra)
+    local t = { name = name, link = "|cff1eff00|Hitem:" .. name .. "|h[" .. name .. "]|h|r", quality = 2,
+        equipLoc = equipLoc or "INVTYPE_CHEST" }
+    for k, v in pairs(extra or {}) do t[k] = v end
+    return t
+end
+
+-- A store with resolved, scored rows: { name, price, state, pct }.
+local function scoredStore(spec)
+    local store = M.NewStore()
+    local entries = {}
+    for i, s in ipairs(spec) do entries[i] = { itemID = i, minPrice = s[2] } end
+    M.Rebuild(store, entries)
+    for i, s in ipairs(spec) do
+        local row = store.rows[i]
+        M.ApplyInfo(store, row, info(s[1]))
+        local state = s[3]
+        if state == "scored" then
+            M.ApplyScore(store, row, { upgradePct = s[4], specName = "Spec" }, nil, 0)
+        elseif state == "unusable" then
+            M.ApplyScore(store, row, nil, "NOT_USABLE", 0)
+        elseif state == "error" then
+            M.ApplyScore(store, row, nil, "ERROR", 0)
+        end -- "pending": leave
+    end
+    return store
+end
+
+local function names(list)
+    local out = {}
+    for i, r in ipairs(list) do out[i] = r.name end
+    return table.concat(out, ",")
+end
+
+---------------------------------------------------------------------------
+-- Items
+---------------------------------------------------------------------------
+
+test("item string without a suffix", function()
+    eq(M.ItemString(19019), "item:19019", "no suffix")
+    eq(M.ItemString(19019, 0), "item:19019", "suffix 0")
+    eq(M.ItemString("19019", nil), "item:19019", "string id, nil suffix")
+    eq(M.ItemString(nil, 5), nil, "no item id")
+end)
+
+test("item string with a suffix puts it in the 7th field", function()
+    local s = M.ItemString(15210, 1200)
+    eq(s, "item:15210::::::1200", "suffix")
+    local fields = {}
+    for f in (s:sub(6) .. ":"):gmatch("([^:]*):") do fields[#fields + 1] = f end
+    eq(fields[1], "15210", "1st field item id")
+    eq(fields[7], "1200", "7th field suffix")
+    eq(M.ItemString(15210, -37), "item:15210::::::-37", "negative suffix kept")
+end)
+
+test("row key separates suffix and item level", function()
+    ok(M.RowKey(1, 0, 60) ~= M.RowKey(1, 5, 60), "suffix")
+    ok(M.RowKey(1, 0, 60) ~= M.RowKey(1, 0, 61), "item level")
+    eq(M.RowKey(1, nil, nil), "1:0:0", "missing parts are 0")
+end)
+
+test("gear filter by equip location", function()
+    for _, loc in ipairs({ "INVTYPE_HEAD", "INVTYPE_CHEST", "INVTYPE_ROBE", "INVTYPE_WEAPON", "INVTYPE_2HWEAPON",
+        "INVTYPE_FINGER", "INVTYPE_TRINKET", "INVTYPE_RANGED", "INVTYPE_CLOAK", "INVTYPE_HOLDABLE", "INVTYPE_RELIC" }) do
+        eq(M.IsGear(loc), true, loc)
+    end
+    for _, loc in ipairs({ "INVTYPE_BAG", "INVTYPE_QUIVER", "INVTYPE_TABARD", "INVTYPE_BODY", "INVTYPE_NON_EQUIP",
+        "INVTYPE_NON_EQUIP_IGNORE", "" }) do
+        eq(M.IsGear(loc), false, loc)
+    end
+    eq(M.IsGear(nil), false, "nil")
+end)
+
+---------------------------------------------------------------------------
+-- Rebuild
+---------------------------------------------------------------------------
+
+test("duplicate item keys keep the lower price, in either order", function()
+    local store = M.NewStore()
+    M.Rebuild(store, {
+        { itemID = 10, itemLevel = 60, minPrice = 5000, totalQuantity = 1 },
+        { itemID = 10, itemLevel = 60, minPrice = 3000, totalQuantity = 2 },
+        { itemID = 11, minPrice = 100 },
+        { itemID = 11, minPrice = 900 },
+        { itemID = 10, itemLevel = 60, itemSuffix = 7, minPrice = 8000 },
+    })
+    eq(#store.rows, 3, "rows")
+    eq(store.byKey["10:0:60"].price, 3000, "lower second")
+    eq(store.byKey["10:0:60"].quantity, 2, "quantity of the cheaper entry")
+    eq(store.byKey["11:0:0"].price, 100, "lower first")
+    eq(store.byKey["10:7:60"].price, 8000, "suffix row separate")
+    eq(store.byKey["10:7:60"].itemString, "item:10::::::7", "suffix row item string")
+    eq(#store.byItem[10], 2, "both rows indexed by item id")
+    eq(store.lastCount, 5, "entries counted")
+end)
+
+test("rebuild skips bad entries, keeps known rows, takes info and scores from the caches", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1, minPrice = 100 }, { itemID = 0 }, { itemID = nil }, { itemID = "x" } })
+    eq(#store.rows, 1, "only the valid entry")
+    local row = store.rows[1]
+    M.ApplyInfo(store, row, info("Vest"))
+    M.ApplyScore(store, row, { upgradePct = 2 }, nil, 0)
+    near(row.value, 2 / 0.01, "value at 1s")
+
+    M.Rebuild(store, { { itemID = 1, minPrice = 200 } })
+    ok(store.rows[1] == row, "same row object kept")
+    near(row.value, 2 / 0.02, "value follows the new price")
+
+    M.Clear(store)
+    eq(#store.rows, 0, "cleared")
+    M.Rebuild(store, { { itemID = 1, minPrice = 400 } })
+    local again = store.rows[1]
+    ok(again ~= row, "a new row after clearing")
+    eq(again.state, "scored", "score from the cache")
+    near(again.value, 2 / 0.04, "value from the cached score and the new price")
+    eq(again.name, "Vest", "info from the cache")
+end)
+
+test("an instant equip location that is not gear skips resolution", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1, equipLoc = "" }, { itemID = 2, equipLoc = "INVTYPE_BAG" },
+        { itemID = 3, equipLoc = "INVTYPE_FEET" }, { itemID = 4 } })
+    eq(store.rows[1].state, "notgear", "empty equip loc")
+    eq(store.rows[2].state, "notgear", "bag")
+    eq(store.rows[3].state, "pending", "gear still needs item info")
+    eq(store.rows[4].state, "pending", "unknown")
+    eq(#M.NextBatch(store, 0, 20), 2, "only the possible gear is worked on")
+end)
+
+---------------------------------------------------------------------------
+-- Value and scores
+---------------------------------------------------------------------------
+
+test("value: upgrade per gold and its edge cases", function()
+    near(M.Value(4.2, 50000), 0.84, "4.2% at 5g")
+    near(M.Value(1, 10000), 1, "1% at 1g")
+    near(M.Value(1, 50), 200, "1% at 50c")
+    eq(M.Value(4.2, 0), nil, "zero price")
+    eq(M.Value(4.2, nil), nil, "no price")
+    eq(M.Value(-1.3, 50000), nil, "negative upgrade")
+    eq(M.Value(0, 50000), nil, "no upgrade")
+    eq(M.Value(nil, 50000), nil, "no score")
+end)
+
+test("score outcomes set the row state; final ones are cached per link", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1, minPrice = 10000 }, { itemID = 2, minPrice = 10000 }, { itemID = 3 },
+        { itemID = 4 }, { itemID = 5 }, { itemID = 6 } })
+    local r = store.rows
+    for i = 1, 6 do M.ApplyInfo(store, r[i], info("I" .. i)) end
+    M.ApplyScore(store, r[1], { upgradePct = 3, specName = "Holy", equipped = false }, nil, 0)
+    M.ApplyScore(store, r[2], nil, "NOT_USABLE", 0)
+    M.ApplyScore(store, r[3], nil, "NOT_EQUIPPABLE", 0)
+    M.ApplyScore(store, r[4], nil, "NOT_CACHED", 10)
+    M.ApplyScore(store, r[5], nil, "ERROR", 0)
+    M.ApplyScore(store, r[6], { upgradePct = nil }, nil, 0)
+    eq(r[1].state, "scored", "scored")
+    eq(r[1].specName, "Holy", "spec kept")
+    near(r[1].value, 3, "value")
+    eq(r[2].state, "unusable", "unusable")
+    eq(r[3].state, "notgear", "SGJ: not equippable")
+    eq(r[4].state, "pending", "not cached: retry")
+    eq(r[4].nextTry, 10 + M.RETRY_BASE, "retry later")
+    eq(r[5].state, "error", "error")
+    eq(r[5].reason, "ERROR", "reason")
+    eq(r[6].state, "error", "no percentage")
+    ok(store.scores[r[1].link] and store.scores[r[2].link] and store.scores[r[3].link], "final outcomes cached")
+    eq(store.scores[r[4].link], nil, "pending not cached")
+    eq(store.scores[r[5].link], nil, "errors not cached: tried again with the next results")
+end)
+
+test("item info that is not gear makes the row not gear", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 1 } })
+    M.ApplyInfo(store, store.rows[1], info("Linen Cloth", ""))
+    eq(store.rows[1].state, "notgear", "state")
+    eq(store.rows[1].link, "|cff1eff00|Hitem:Linen Cloth|h[Linen Cloth]|h|r", "link kept")
+    M.Rebuild(store, { { itemID = 1 } })
+    M.ApplyInfo(store, store.rows[1], { name = "No Link", equipLoc = "INVTYPE_HEAD" })
+    eq(store.rows[1].link, "item:1", "item string when the client gives no link")
+end)
+
+---------------------------------------------------------------------------
+-- Batches
+---------------------------------------------------------------------------
+
+test("batches: limited size, due rows only, backoff, give up", function()
+    local store = M.NewStore()
+    local entries = {}
+    for i = 1, 45 do entries[i] = { itemID = i } end
+    M.Rebuild(store, entries)
+    local b1 = M.NextBatch(store, 0, 20)
+    eq(#b1, 20, "first batch limited")
+    eq(b1[1].itemID, 1, "browse order")
+    for _, row in ipairs(b1) do M.Defer(row, 0, "ITEM_INFO") end
+    local b2 = M.NextBatch(store, 0, 20)
+    eq(#b2, 20, "second batch")
+    eq(b2[1].itemID, 21, "deferred rows are not due")
+    for _, row in ipairs(b2) do M.Defer(row, 0, "ITEM_INFO") end
+    eq(#M.NextBatch(store, 0, 20), 5, "the rest")
+    eq(#M.NextBatch(store, M.RETRY_BASE, 100), 45, "all due after the first delay")
+
+    local row = store.rows[1]
+    local delays = {}
+    for i = 2, 6 do
+        M.Defer(row, 100, "ITEM_INFO")
+        delays[#delays + 1] = row.nextTry - 100
+    end
+    eq(table.concat(delays, ","), "1,2,4,5,5", "doubling up to the maximum")
+    for _ = 7, M.MAX_TRIES do M.Defer(row, 100, "NOT_READY") end
+    eq(row.state, "error", "gave up")
+    eq(row.reason, "GAVE_UP NOT_READY", "reason names the last wait")
+end)
+
+test("item info arriving makes waiting rows of that item due", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 7 }, { itemID = 7, itemSuffix = 3 }, { itemID = 8 } })
+    for _, row in ipairs(store.rows) do M.Defer(row, 0, "ITEM_INFO") end
+    eq(#M.NextBatch(store, 0.1, 20), 0, "none due")
+    eq(M.InfoArrived(store, 7), true, "rows found")
+    eq(M.InfoArrived(store, 99), false, "unknown item")
+    local due = M.NextBatch(store, 0.1, 20)
+    eq(#due, 2, "both rows of item 7")
+end)
+
+test("SCORES_CHANGED resets gear rows and drops the cache, not-gear rows stay", function()
+    local store = scoredStore({ { "A", 10000, "scored", 2 }, { "B", 10000, "unusable" }, { "C", 10000, "pending" } })
+    M.Rebuild(store, { { itemID = 1, minPrice = 10000 }, { itemID = 2, minPrice = 10000 }, { itemID = 3, minPrice = 10000 },
+        { itemID = 4, equipLoc = "" } })
+    M.Defer(store.rows[3], 0, "NOT_READY")
+    M.InvalidateScores(store)
+    eq(next(store.scores), nil, "cache dropped")
+    for i = 1, 3 do
+        eq(store.rows[i].state, "pending", "row " .. i .. " pending")
+        eq(store.rows[i].nextTry, 0, "row " .. i .. " due now")
+        eq(store.rows[i].upgradePct, nil, "row " .. i .. " old score gone")
+    end
+    eq(store.rows[4].state, "notgear", "not gear untouched")
+end)
+
+---------------------------------------------------------------------------
+-- Filter and sort
+---------------------------------------------------------------------------
+
+local SPEC = {
+    { "Alpha", 20000, "scored", 4 },    -- value 2
+    { "Bravo", 5000, "scored", 1 },     -- value 2, cheaper
+    { "Charlie", 100000, "scored", 9 }, -- value 0.9
+    { "Delta", 1000, "scored", -2 },    -- downgrade, no value
+    { "Echo", 3000, "pending" },
+    { "Foxtrot", 2000, "unusable" },
+    { "Golf", 4000, "error" },
+}
+
+test("filters: upgrades only, hide unusable", function()
+    local store = scoredStore(SPEC)
+    M.Rebuild(store, { { itemID = 1, minPrice = 20000 }, { itemID = 2, minPrice = 5000 }, { itemID = 3, minPrice = 100000 },
+        { itemID = 4, minPrice = 1000 }, { itemID = 5, minPrice = 3000 }, { itemID = 6, minPrice = 2000 },
+        { itemID = 7, minPrice = 4000 }, { itemID = 8, minPrice = 10 }, { itemID = 9, equipLoc = "" } })
+    -- row 8: unresolved, row 9: not gear: never listed
+    local function count(opts) return #M.Filter(store, opts) end
+    eq(count({ upgradesOnly = true, hideUnusable = true }), 3, "upgrades only")
+    eq(count({ upgradesOnly = true, hideUnusable = false }), 3, "upgrades are usable")
+    eq(count({ upgradesOnly = false, hideUnusable = true }), 6, "all resolved gear but unusable")
+    eq(count({ upgradesOnly = false, hideUnusable = false }), 7, "all resolved gear")
+end)
+
+test("sort by % per gold: value, then rows without one (scored by upgrade, pending, error, unusable)", function()
+    local store = scoredStore(SPEC)
+    local all = { upgradesOnly = false, hideUnusable = false }
+    eq(names(M.Sort(M.Filter(store, all), "value", true)), "Alpha,Bravo,Charlie,Delta,Echo,Golf,Foxtrot", "descending")
+    eq(names(M.Sort(M.Filter(store, all), "value", false)), "Charlie,Alpha,Bravo,Delta,Echo,Golf,Foxtrot",
+        "ascending: rows without a value still last")
+end)
+
+test("sort by upgrade", function()
+    local store = scoredStore(SPEC)
+    local all = { upgradesOnly = false, hideUnusable = false }
+    eq(names(M.Sort(M.Filter(store, all), "upgrade", true)), "Charlie,Alpha,Bravo,Delta,Echo,Golf,Foxtrot", "descending")
+    eq(names(M.Sort(M.Filter(store, all), "upgrade", false)), "Delta,Bravo,Alpha,Charlie,Echo,Golf,Foxtrot", "ascending")
+end)
+
+test("sort by price and by name", function()
+    local store = scoredStore(SPEC)
+    local all = { upgradesOnly = false, hideUnusable = false }
+    eq(names(M.Sort(M.Filter(store, all), "price", false)), "Delta,Foxtrot,Echo,Golf,Bravo,Alpha,Charlie", "price ascending")
+    eq(names(M.Sort(M.Filter(store, all), "price", true)), "Charlie,Alpha,Bravo,Golf,Echo,Foxtrot,Delta", "price descending")
+    eq(names(M.Sort(M.Filter(store, all), "name", false)), "Alpha,Bravo,Charlie,Delta,Echo,Foxtrot,Golf", "name ascending")
+    eq(names(M.Sort(M.Filter(store, all), "name", true)), "Golf,Foxtrot,Echo,Delta,Charlie,Bravo,Alpha", "name descending")
+    store.rows[1].price = nil
+    eq(names(M.Sort(M.Filter(store, all), "price", true)):sub(-5), "Alpha", "no price: last")
+end)
+
+test("view uses the saved sort; header clicks pick a natural direction, then reverse", function()
+    local store = scoredStore(SPEC)
+    local opts = { upgradesOnly = true, hideUnusable = true, sortColumn = "value", sortDesc = true }
+    eq(names(M.View(store, opts)), "Alpha,Bravo,Charlie", "default % per gold descending")
+    M.ToggleSort(opts, "value")
+    eq(opts.sortDesc, false, "same column reverses")
+    M.ToggleSort(opts, "price")
+    eq(opts.sortColumn .. tostring(opts.sortDesc), "pricefalse", "price starts ascending")
+    eq(names(M.View(store, opts)), "Bravo,Alpha,Charlie", "by price")
+    M.ToggleSort(opts, "upgrade")
+    eq(opts.sortColumn .. tostring(opts.sortDesc), "upgradetrue", "upgrade starts descending")
+    M.ToggleSort(opts, "name")
+    eq(opts.sortColumn .. tostring(opts.sortDesc), "namefalse", "name starts ascending")
+    eq(M.SortLabel({ sortColumn = "value", sortDesc = true }), "% per gold descending", "label")
+end)
+
+---------------------------------------------------------------------------
+-- Formatting
+---------------------------------------------------------------------------
+
+test("money formatting", function()
+    eq(M.FormatMoney(0), "0c", "zero")
+    eq(M.FormatMoney(7), "7c", "copper")
+    eq(M.FormatMoney(520), "5s 20c", "silver and copper")
+    eq(M.FormatMoney(500), "5s", "silver")
+    eq(M.FormatMoney(123456), "12g 34s", "gold drops copper")
+    eq(M.FormatMoney(120000), "12g", "even gold")
+    eq(M.FormatMoney(120056), "12g", "gold with only copper")
+    eq(M.FormatMoney(nil), "?", "no price")
+    eq(M.DisplayCopper(123456), 123400, "coin text without copper from 1g")
+    eq(M.DisplayCopper(9999), 9999, "below 1g unchanged")
+end)
+
+test("upgrade and value formatting", function()
+    local function up(row) local t, c = M.FormatUpgrade(row); return t .. " " .. c end
+    eq(up({ state = "scored", upgradePct = 4.2 }), "+4.2% good", "upgrade")
+    eq(up({ state = "scored", upgradePct = -1.3 }), "-1.3% dim", "downgrade")
+    eq(up({ state = "scored", upgradePct = 0 }), "+0.0% dim", "no change")
+    eq(up({ state = "pending" }), "... dim", "pending")
+    eq(up({ state = "unusable" }), "unusable bad", "unusable")
+    eq(up({ state = "error" }), "error bad", "error")
+    eq(M.FormatValue(0.84), "0.84 %/g", "value")
+    eq(M.FormatValue(12.345), "12.3 %/g", "tens")
+    eq(M.FormatValue(250), "250 %/g", "hundreds")
+    eq(M.FormatValue(0.0012), "0.0012 %/g", "tiny")
+    eq(M.FormatValue(nil), "", "no value")
+end)
+
+test("count line", function()
+    local store = scoredStore(SPEC)
+    M.Rebuild(store, { { itemID = 1 }, { itemID = 2 }, { itemID = 3 }, { itemID = 4 }, { itemID = 5 }, { itemID = 6 },
+        { itemID = 7 }, { itemID = 8 }, { itemID = 9, equipLoc = "" } })
+    local c = M.Counts(store)
+    eq(c.gear, 7, "gear")
+    eq(c.upgrades, 3, "upgrades")
+    eq(c.pending, 2, "pending: one to score, one to resolve")
+    eq(c.resolving, 1, "resolving")
+    eq(c.notgear, 1, "not gear")
+    eq(M.CountLine(c, true), "7 gear items, 3 upgrades, 2 pending", "line")
+    eq(M.CountLine({ total = 1, gear = 1, upgrades = 1, pending = 0 }), "1 gear item, 1 upgrade, 0 pending", "singular")
+    eq(M.CountLine(c, false), "7 gear items, 3 upgrades, 2 pending (more results not loaded)", "partial")
+    eq(M.CountLine({ total = 0 }), "No browse results yet: search the auction house.", "empty")
+end)
+
+return H

@@ -1,0 +1,11 @@
+## Interface: 16001
+## Title: AuctionJudge
+## Notes: Lists the gear in the current auction house results with Sharpie's Gear Judge upgrades and upgrade per gold.
+## Version: 0.1.0
+## OptionalDeps: SharpiesGearJudge
+## SavedVariables: AuctionJudgeDB
+
+Model.lua
+Game.lua
+Panel.lua
+Core.lua
