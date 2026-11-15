@@ -365,7 +365,7 @@ end
 ---A group's item search results arrived: results { link, buyout, bid, quantity } (plain values). The group
 ---is listed as one row per distinct item (ItemIdentity), with the lowest-priced auction's link (price is
 ---the buyout, else the bid, then marked bid; at the same price a buyout wins) and the number of auctions
----merged. Each row is judged by its own link; rows take item info from the group and cached scores.
+---merged (shown in /aj debug and the dump only). Each row is judged by its own link; rows take item info from the group and cached scores.
 ---Returns the number of auction rows.
 function M.SetAuctions(store, group, results)
     local byId, order = {}, {}
@@ -730,13 +730,6 @@ function M.ScanState(row, ctx)
     if qs == "failed" or qs == "timeout" then return "Lookup failed" end
     if ctx.capReached then return "Not looked up (limit reached)" end
     return "Waiting to be looked up"
-end
-
----The name shown for a row: "Cadet Vest of the Whale x4" when several auctions of the item were merged.
-function M.DisplayName(row)
-    local name = row.name or row.itemString or "?"
-    if row.auctionCount and row.auctionCount > 1 then name = name .. " x" .. row.auctionCount end
-    return name
 end
 
 ---Upgrade column text and colour key.

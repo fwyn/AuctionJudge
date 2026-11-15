@@ -593,7 +593,7 @@ test("item identity: link metadata and modifiers ignored, bonus IDs kept", funct
         "fewer bonus IDs than counted: the raw link")
 end)
 
-test("auctions merged by item identity: x count, cheapest kept, buyout before bid at the same price", function()
+test("auctions merged by item identity: count kept, cheapest kept, buyout before bid at the same price", function()
     local store = M.NewStore()
     M.Rebuild(store, { { itemID = 9765, itemSuffix = 14309, minPrice = 500 } })
     local group = store.rows[1]
@@ -606,9 +606,7 @@ test("auctions merged by item identity: x count, cheapest kept, buyout before bi
         { link = c, buyout = 400 } }), 2, "the two links of one item are one row; another bonus ID is another")
     local r1, r2 = group.auctions[1], group.auctions[2]
     eq(r1.auctionCount .. " " .. r1.price .. " " .. r1.link, "2 500 " .. b, "merged: cheapest auction's link and price")
-    eq(M.DisplayName(r1), "Cadet Vest of Intellect x2", "count after the name")
     eq(r2.price .. " " .. tostring(r2.bid), "400 false", "same price: the buyout wins over the bid-only auction")
-    eq(M.DisplayName({ name = "Solo", auctionCount = 1 }), "Solo", "no count for one auction")
     eq(M.DumpRow(r1, {}).auctionCount .. " " .. M.DumpRow(r1, {}).identity, "2 9765:::::::|12729", "in the dump")
 end)
 

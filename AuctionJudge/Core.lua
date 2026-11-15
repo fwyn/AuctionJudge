@@ -330,8 +330,9 @@ function ns.RowClicked(row)
         if not Game.InsertLink(link) then ns.Print(link) end
         return
     end
+    -- the full name as listed, random suffix included; the base name only when there is none
     local group = row.group or row
-    local name = Game.BaseName(group.itemID) or group.name
+    local name = row.name or group.name or Game.BaseName(group.itemID)
     if not Game.Search(name) then ns.Print("could not search the auction house for " .. link) end
 end
 

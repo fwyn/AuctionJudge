@@ -659,7 +659,7 @@ test("row tooltip, search click, shift-click link", function()
     local cloak
     for _, r in ipairs(C.shownRows()) do if r.cells.name.text == "Bandit's Cloak of the Bear" then cloak = r end end
     click(cloak)
-    eq(C.searched, "Bandit's Cloak", "search by base name")
+    eq(C.searched, "Bandit's Cloak of the Bear", "search by the full name, random suffix included")
 
     C.shift = true
     C.chatOpen = true
@@ -943,7 +943,7 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     ok(X.searches[1].at >= X.browseAt + 1.5 - 1e-9, "held off 1.5 s after the browse results")
     eq(X.searches[1].sorts[1].sortOrder, 4, "sorted by buyout")
     ok(X.searches[1].itemKey == X.results[1].itemKey, "the browse result's own item key is passed")
-    eq(X.rowNames(), "Cadet Vest of Healing x2,Cadet Vest of Healing,Cadet Vest of the Whale,Iron Helm,"
+    eq(X.rowNames(), "Cadet Vest of Healing,Cadet Vest of Healing,Cadet Vest of the Whale,Iron Helm,"
         .. "Cadet Vest of Intellect", "one row per distinct item (link metadata ignored), by value")
     eq(upgrades(X), "+15.4%,+9.0%,+11.8%,+3.0%,+6.0%", "exact scores, none starred")
     local rows = X.shownRows()
@@ -952,6 +952,10 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     local healing = X.ns.store.byKey["501:" .. HEALING]
     eq(#healing.auctions, 2, "two distinct items")
     eq(healing.auctions[1].link, H1, "the cheaper auction's link")
+    eq(healing.auctions[1].auctionCount, 2, "merge count kept for debug and the dump")
+    local click = function(b) b.scripts.OnClick(b, "LeftButton") end
+    click(rows[1])
+    eq(X.searched, "Cadet Vest of Healing", "auction row: search by its full name")
     eq(healing.auctions[1].sgjLink, H1, "SGJ judged the auction's link")
     eq(countLine(X), "6 gear items, 5 upgrades, 0 pending", "count line, nothing left resolving")
     eq(X.updaters(), 0, "idle once done")
@@ -1019,7 +1023,7 @@ test("exact: nothing is searched while the throttle is not ready", function()
     eq(#X.searches, 3, "searches once ready")
     local first = X.shownRows()[1]
     eq(first.cells.name.text .. " " .. rgb(first.cells.name.color) .. " " .. tostring(first.icon.desaturated),
-        "Cadet Vest of Healing x2 0.12,1,0 false", "resolved auction rows in normal colours")
+        "Cadet Vest of Healing 0.12,1,0 false", "resolved auction rows in normal colours")
     for _, b in ipairs(X.shownRows()) do eq(b.scanReason, nil, "no row greyed once resolved") end
     X.closeAH()
     clean(X)
@@ -1182,6 +1186,8 @@ test("exact off: no searches, base scores starred", function()
     local b = X.shownRows()[1]
     b.scripts.OnEnter(b)
     eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score. Scan specific items is off", "tooltip note")
+    b.scripts.OnClick(b, "LeftButton")
+    eq(X.searched, "Cadet Vest of Healing", "group row: search by its full name")
     X.slash("exact on")
     X.advance(4)
     eq(#X.searches, 3, "on again: searched")
