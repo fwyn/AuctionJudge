@@ -4,7 +4,7 @@
 -- sends browse queries, and never buys, bids or posts.
 local ADDON, ns = ...
 
-local M, Q, Game, Panel = ns.Model, ns.Queue, ns.Game, ns.Panel
+local M, Q, Game, Panel, Hist = ns.Model, ns.Queue, ns.Game, ns.Panel, ns.History
 
 local PREFIX = "|cff33ccffAuctionJudge|r: "
 local READ_DELAY = 0.2       -- debounce for browse result events
@@ -26,6 +26,9 @@ local lastReadError
 local specName
 local exactDisabled      -- why item searches are off for this session (missing or failing API)
 local lastWhy            -- why the queue did not send at its last turn
+local search             -- the current search's summary while it runs (saved to the history when it ends)
+local retained           -- the last search with results, after a new one replaced it: its store fields by
+                         -- reference (no copy), so the dump can show it if the new search ends with nothing
 
 function ns.Print(msg) print(PREFIX .. msg) end
 
@@ -57,6 +60,7 @@ local function initDB()
     for _, col in ipairs(M.COLUMNS) do if db.sortColumn == col then known = true end end
     if not known then db.sortColumn, db.sortDesc = DEFAULTS.sortColumn, DEFAULTS.sortDesc end
     if type(db.maxQueries) ~= "number" or db.maxQueries < 0 then db.maxQueries = DEFAULTS.maxQueries end
+    db.history = Hist.Clean(db.history)
     ns.db = db
     M.SetExactView(store, db.exact)
 end
@@ -70,6 +74,14 @@ end
 -- View
 ---------------------------------------------------------------------------
 
+---The item search state for row greying (ScanState) and the progress line (LookupState).
+local function scanState()
+    local db = ns.db
+    return { on = db.exact == true, active = exactActive(), disabled = exactDisabled,
+        capReached = queue.sent >= db.maxQueries, cap = db.maxQueries, sent = queue.sent,
+        inflight = queue.inflight ~= nil }
+end
+
 local function buildView()
     local usable = Game.SGJUsable()
     local db = ns.db
@@ -81,7 +93,7 @@ local function buildView()
         full = store.full,
         exact = exactActive(),
         exactDisabled = exactDisabled,
-        scan = { on = db.exact == true, disabled = exactDisabled, capReached = queue.sent >= db.maxQueries },
+        scan = scanState(),
         list = usable and M.View(store, db) or {},
         opts = db,
     }
@@ -132,15 +144,96 @@ local function enqueueAll()
     for _, row in ipairs(store.rows) do enqueue(row) end
 end
 
+---------------------------------------------------------------------------
+-- Search history: one summary per search, from a fresh browse search (RESULTS_UPDATED), more results
+-- without a search seen (RESULTS_ADDED), or results already there on opening; until replaced or closed.
+---------------------------------------------------------------------------
+
+---start: "search", "added" (its start was not seen) or "open".
+local function newSearch(start)
+    search = { start = start, time = Game.DateText(), spec = Game.SpecName(), reads = 0 }
+end
+
+---Why the item searches stopped (or never ran) for search s and the current results: unread, read failed,
+---complete, disabled, cap, incomplete (looking still), pending (rows not resolved yet), nothing to look up,
+---inactive (no SGJ) or off.
+local function scanStop(s, c)
+    if s.reads == 0 then return s.readError and "read failed" or "unread" end
+    local state = M.LookupState(c, scanState())
+    if state == "stopped" then return "cap" end
+    if state == "looking" then return "incomplete" end
+    if state then return state end
+    if c.groups == 0 then return store.pending > 0 and "pending" or "nothing to look up" end
+    return ns.db.exact == true and "inactive" or "off"
+end
+
+---Search s's summary as plain values, from the store and the queue (its counts are per search) as they are now.
+local function summarize(s, ended)
+    local c = M.Counts(store)
+    local e = {
+        time = s.time, start = s.start, ended = ended, spec = Game.SpecName() or s.spec, -- as scored last
+        reads = s.reads, raw = s.raw, rows = s.rows, full = s.full, readError = s.readError,
+        lookups = queue.sent, failures = queue.failures, stop = scanStop(s, c), disabled = exactDisabled,
+    }
+    -- not read at all is stop "unread"; read, then more results added and not read, is readPending
+    if s.reads > 0 then
+        e.readPending = readAt ~= nil or nil
+        e.queued, e.inflight, e.pending = Q.Length(queue), queue.inflight ~= nil or nil, store.pending
+        e.upgrades, e.confirmedUpgrades, e.estimatedUpgrades = c.upgrades, c.confirmedUpgrades, c.estimatedUpgrades
+        e.groups, e.groupsDone, e.groupsResolved = c.groups, c.groupsDone, c.groupsResolved
+    end
+    return e
+end
+
+local finished -- the summary of the search ended last this session (the dump's search)
+
+---Ends the current search and saves its summary, once: ended is "replaced", "closed" or "logout". Reads
+---the store and the queue, so it runs before they are cleared.
+local function finishSearch(ended)
+    local s = search
+    if not s or not ns.db then return end
+    search = nil
+    finished = summarize(s, ended)
+    Hist.Add(ns.db.history, finished)
+end
+
+---Reads a row's required level when it is wanted (Model.LevelWanted): an auction row from its own link, a
+---browse row from the item key of the variant it shows (when the client has that), else its item info. Not
+---cached item data is left to its GET_ITEM_INFO_RECEIVED; readable data without a level counts as a miss.
+---true when a level was set.
+local function readLevel(row)
+    if not M.LevelWanted(row) then return false end
+    if not row.isAuction then
+        local level = Game.ItemKeyRequiredLevel(row.itemID, row.itemLevel, row.suffix)
+        if level then return M.SetMinLevel(store, row, level, "key", row.itemLevel) end
+    end
+    local info = Game.ItemInfo(row.isAuction and row.link or row.itemString)
+    if not info then return false end
+    if M.SetMinLevel(store, row, info.minLevel, row.isAuction and "link" or "item") then return true end
+    row.levelMisses = (row.levelMisses or 0) + 1
+    return false
+end
+
+local function readLevels(list)
+    local any = false
+    for _, row in ipairs(list) do
+        if readLevel(row) then any = true end
+    end
+    return any
+end
+
 local function readResults()
     -- the raw count (or the error text when entries is nil) and the results left out by the reader
     local entries, rawOrError, skipped = Game.BrowseResults()
     if not entries then
         lastReadError = rawOrError
+        if search then search.readError = rawOrError end
         return
     end
     local raw = rawOrError
     lastReadError = nil
+    -- results there on opening (no search seen) count as a search; an empty list on opening does not
+    if not search and raw > 0 then newSearch("open") end
     for _, e in ipairs(entries) do
         local loc = instant[e.itemID]
         if loc == nil then
@@ -150,8 +243,14 @@ local function readResults()
         e.equipLoc = loc
     end
     M.Rebuild(store, entries, skipped)
+    readLevels(store.rows) -- rows from the caches with an unknown level, or a keyed level of another variant
     store.lastCount = raw
     store.full = Game.HasFullBrowseResults()
+    if search then
+        search.reads, search.raw, search.rows, search.full = search.reads + 1, raw, #store.rows, store.full
+        search.readError = nil
+    end
+    if raw > 0 then retained = nil end -- the dump shows these results now
     enqueueAll() -- groups already judged from the caches
     markDirty()
 end
@@ -171,13 +270,17 @@ local function work(row, now)
             M.Defer(store, row, now, "ITEM_KEY_INFO")
             return
         end
-        M.ApplyInfo(store, row, M.MergeInfo(base, keyInfo, row.suffix), now)
+        local keyLevel = Game.ItemKeyRequiredLevel(row.itemID, row.itemLevel, row.suffix)
+        M.ApplyInfo(store, row, M.MergeInfo(base, keyInfo, row.suffix, keyLevel, row.itemLevel), now)
         -- not gear, a cached outcome, or an unknown equip location deferred for a retry
         if row.state ~= "pending" or not row.info then
             enqueue(row)
             return
         end
     end
+    -- an auction's own link may need another level than its group: read as it is judged (SGJ needs the same
+    -- item info, so a link not cached yet is read again with the next try)
+    if row.isAuction then readLevel(row) end
     -- auction rows carry their own auction link; browse rows the item info link
     local result, reason = Game.Score(row.link)
     if reason == "NOT_CACHED" then Game.RequestItem(row.itemID) end
@@ -264,6 +367,7 @@ local function onItemSearchResults(itemKey)
     local results, total = Game.ItemSearchResults(group.itemKeyRef)
     if not results or #results == 0 then return end -- not there yet: more events follow, or the timeout
     M.SetAuctions(store, group, results)
+    readLevels(group.auctions) -- auction rows with a cached score are not judged again
     Q.Resolved(queue, group, total)
     markDirty()
 end
@@ -301,15 +405,16 @@ function ns.SortBy(col)
     refresh()
 end
 
----Exact mode ("Scan specific items", /aj exact): off cancels the queue at once and lists resolved groups as
+---Exact mode ("Scan specific items", /aj exact): off stops the queue at once and lists resolved groups as
 ---their starred group rows again; on lists their auctions again and queues the groups not resolved yet.
+---The searches already sent still count towards this search's cap.
 local function setExact(on)
     ns.db.exact = on and true or false
     if ns.db.exact then
         M.SetExactView(store, true)
         enqueueAll()
     else
-        Q.Cancel(queue)
+        Q.Stop(queue)
         M.SetExactView(store, false)
     end
     Panel.ResetScroll()
@@ -341,7 +446,7 @@ end
 ---------------------------------------------------------------------------
 
 local handlers = {}
-local OPTIONAL_EVENTS = { "ITEM_KEY_ITEM_INFO_RECEIVED", "ITEM_SEARCH_RESULTS_UPDATED", "ITEM_SEARCH_RESULTS_ADDED",
+local OPTIONAL_EVENTS = { "ITEM_KEY_ITEM_INFO_RECEIVED", "EXTRA_BROWSE_INFO_RECEIVED", "ITEM_SEARCH_RESULTS_UPDATED", "ITEM_SEARCH_RESULTS_ADDED",
     "AUCTION_HOUSE_THROTTLED_SYSTEM_READY" }
 
 function handlers.ADDON_LOADED(name)
@@ -379,20 +484,41 @@ local function exactState()
     }
 end
 
+---A table's fields, the plain ones only when plain (a copy, not deep).
+local function copy(t, plain)
+    if not t then return nil end
+    local out = {}
+    for k, v in pairs(t) do if not (plain and type(v) == "table") then out[k] = v end end
+    return out
+end
+
+---What a dump records beside the rows, as it is now: time, why, SGJ, settings, read error, queue, search.
+local function dumpContext(why)
+    return { time = Game.DateText(), why = why, sgjLoaded = Game.SGJUsable(), sgjReady = Game.SGJReady(),
+        spec = Game.SpecName(), lastReadError = lastReadError, exact = exactState(), opts = copy(ns.db, true),
+        search = copy(finished) }
+end
+
 ---Saves what the auction house showed into AuctionJudgeDB.lastDump (plain values only). Built only when
----the auction house closes or the player logs out with it open.
+---the auction house closes or the player logs out with it open: from the results shown, or when there
+---are none (an empty visit, a search not read yet) from the search they replaced, as it was then. With
+---neither, the last dump stays.
 local function writeDump(why)
     if not ns.db then return end
-    local d = M.Dump(store, ns.db)
-    d.time = Game.DateText()
-    d.why = why
-    d.sgjLoaded = Game.SGJUsable()
-    d.sgjReady = Game.SGJReady()
-    d.spec = Game.SpecName()
-    d.lastReadError = lastReadError
-    d.exact = exactState()
+    local src, ctx = store, nil
+    if store.lastCount == 0 and retained then
+        src, ctx = retained.store, retained.ctx
+    elseif store.lastCount == 0 and ns.db.lastDump ~= nil then
+        return
+    else
+        ctx = dumpContext(why)
+        if store.lastCount == 0 then ctx.search = nil end -- nothing read: the last search is not this one
+    end
+    local d = M.Dump(src, ctx.opts)
+    for k, v in pairs(ctx) do if k ~= "opts" then d[k] = v end end
+    d.writeReason = why ~= ctx.why and why or nil
     -- the first random suffix group's tooltip text next to its first auction's, to compare stats by eye
-    for _, row in ipairs(store.rows) do
+    for _, row in ipairs(src.rows) do
         if row.suffix ~= 0 and row.info and row.state ~= "notgear" then
             local first = row.auctions and row.auctions[1]
             d.suffixSample = {
@@ -406,12 +532,21 @@ local function writeDump(why)
     ns.db.lastDump = d
 end
 
+-- Logging out (or a reload) with the auction house open ends the search; closing after that finds it
+-- ended and records nothing more.
 function handlers.PLAYER_LOGOUT()
-    if open then safe("dump", writeDump, "logout") end
+    if open then
+        safe("history", finishSearch, "logout")
+        safe("dump", writeDump, "logout")
+    end
 end
 
 function handlers.AUCTION_HOUSE_CLOSED()
-    if open then safe("dump", writeDump, "closed") end
+    if open then
+        safe("history", finishSearch, "closed")
+        safe("dump", writeDump, "closed")
+    end
+    search, retained = nil, nil
     open = false
     sleep()
     driver:UnregisterEvent("GET_ITEM_INFO_RECEIVED")
@@ -427,8 +562,15 @@ function handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
     -- a new search replaced the results: the old rows go now (their auctions, browse prices and item searches
     -- are stale; a late item search reply finds no group). The list stays empty until the new results are
     -- read; groups judged before are scored from the session caches and looked up afresh.
-    Q.Cancel(queue)
+    -- Keep the last useful results until the replacement search supplies its own.
+    safe("history", finishSearch, "replaced")
+    if store.lastCount > 0 then
+        local ok, ctx = pcall(dumpContext, "replaced")
+        if ok then retained = { store = copy(store), ctx = ctx } else report("history", ctx) end
+    end
+    Q.Cancel(queue, true)
     M.Clear(store)
+    newSearch("search")
     Q.Hold(queue, GetTime())
     Panel.ResetScroll()
     scheduleRead()
@@ -437,14 +579,32 @@ end
 
 function handlers.AUCTION_HOUSE_BROWSE_RESULTS_ADDED()
     if not open then return end
+    if not search then newSearch("added") end -- results without a search seen: one that started unseen
     Q.Hold(queue, GetTime())
     scheduleRead()
 end
 
 function handlers.GET_ITEM_INFO_RECEIVED(itemID)
-    if open and M.InfoArrived(store, itemID) then wake() end
+    if not open then return end
+    if M.InfoArrived(store, itemID) then wake() end
+    -- delayed required levels, scored rows included
+    if readLevels(M.ItemRows(store, itemID)) then markDirty() end
 end
 handlers.ITEM_KEY_ITEM_INFO_RECEIVED = handlers.GET_ITEM_INFO_RECEIVED
+
+-- The auction house can supply a key's level after the base item has already been scored.
+function handlers.EXTRA_BROWSE_INFO_RECEIVED(itemID)
+    if not open then return end
+    for _, row in ipairs(store.byItem[itemID] or {}) do
+        if row.info and row.state ~= "notgear" then
+            local level = Game.ItemKeyRequiredLevel(row.itemID, row.itemLevel, row.suffix)
+            if level ~= nil and (row.minLevelSource ~= "key" or row.minLevel ~= level) then
+                M.SetMinLevel(store, row, level, "key", row.itemLevel)
+                markDirty()
+            end
+        end
+    end
+end
 
 function handlers.ITEM_SEARCH_RESULTS_UPDATED(itemKey)
     if open then onItemSearchResults(itemKey) end
@@ -453,6 +613,13 @@ handlers.ITEM_SEARCH_RESULTS_ADDED = handlers.ITEM_SEARCH_RESULTS_UPDATED
 
 function handlers.AUCTION_HOUSE_THROTTLED_SYSTEM_READY()
     wake()
+end
+
+---SGJ's SCORES_CHANGED follows a level-up too (and redraws); this redraws the "Requires" labels at once with
+---the new level, which UnitLevel may not give yet.
+function handlers.PLAYER_LEVEL_UP(level)
+    Game.NoteLevelUp(level)
+    if open then markDirty() end
 end
 
 driver:SetScript("OnEvent", function(_, event, ...)
@@ -466,6 +633,7 @@ driver:RegisterEvent("AUCTION_HOUSE_SHOW")
 driver:RegisterEvent("AUCTION_HOUSE_CLOSED")
 driver:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
 driver:RegisterEvent("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+driver:RegisterEvent("PLAYER_LEVEL_UP")
 
 ---------------------------------------------------------------------------
 -- Slash commands
@@ -504,15 +672,16 @@ local function status()
     local c = M.Counts(store)
     local cached = 0
     for _ in pairs(store.scores) do cached = cached + 1 end
-    ns.Print(string.format("Rows: %d listed from %d browse rows (gear %d, upgrades %d; scored %d, pending %d of which "
-        .. "resolving %d, unusable %d, error %d, not gear %d); %d scores cached", #store.leaves, c.total, c.gear,
-        c.upgrades, c.scored, c.pending, c.resolving, c.unusable, c.error, c.notgear, cached))
+    ns.Print(string.format("Rows: %d listed from %d browse rows (gear %d, upgrades %d: confirmed %d, estimated %d; "
+        .. "scored %d, pending %d of which resolving %d, unusable %d, error %d, not gear %d); %d scores cached",
+        #store.leaves, c.total, c.gear, c.upgrades, c.confirmedUpgrades, c.estimatedUpgrades, c.scored, c.pending,
+        c.resolving, c.unusable, c.error, c.notgear, cached))
     local x = exactState()
-    ns.Print(string.format("Exact scores: %s%s; random suffix groups %d, done %d; queue %d queued, %d sent this search "
-        .. "(max %d), %d failed%s%s", x.active and "on" or (x.setting and "on but inactive" or "off"),
-        x.disabled and (" (disabled: " .. x.disabled .. ")") or "", c.groups, c.groupsDone, x.queued, x.sent,
-        x.maxQueries, x.failures, x.inflight and ("; in flight " .. x.inflight) or "",
-        x.waiting and ("; waiting: " .. x.waiting) or ""))
+    ns.Print(string.format("Exact scores: %s%s; random suffix groups %d, done %d (checked %d); lookups %s; queue %d "
+        .. "queued, %d sent this search (max %d), %d failed%s%s", x.active and "on" or (x.setting and "on but inactive" or "off"),
+        x.disabled and (" (disabled: " .. x.disabled .. ")") or "", c.groups, c.groupsDone, c.groupsResolved,
+        M.LookupState(c, scanState()) or "-", x.queued, x.sent, x.maxQueries, x.failures,
+        x.inflight and ("; in flight " .. x.inflight) or "", x.waiting and ("; waiting: " .. x.waiting) or ""))
     ns.Print("Item search API: " .. x.api .. "; sort " .. x.sort)
     local db = ns.db
     ns.Print(string.format("Panel: %s, %s; upgrades only %s, hide unusable %s, sort %s",
@@ -542,6 +711,14 @@ local function debug()
     end
 end
 
+---/aj history: the recorded searches, newest first, and the one running now.
+local function history()
+    local list = ns.db.history
+    ns.Print(string.format("Searches: %d recorded (the latest %d are kept), newest first", #list, Hist.MAX))
+    if search then ns.Print("now: " .. Hist.Line(summarize(search, nil))) end
+    for i = #list, 1, -1 do ns.Print(Hist.Line(list[i])) end
+end
+
 local function slash(msg)
     local cmd, arg = (msg or ""):match("^%s*(%S*)%s*(.-)%s*$")
     cmd = cmd:lower()
@@ -560,12 +737,14 @@ local function slash(msg)
         setExact(arg == "on")
         ns.Print("exact scores for random suffix items " .. arg .. (exactDisabled and (" (disabled this session: "
             .. exactDisabled .. ")") or ""))
+    elseif cmd == "history" then
+        history()
     elseif cmd == "maxqueries" and tonumber(arg) then
         ns.db.maxQueries = math.max(0, math.floor(tonumber(arg)))
         ns.Print("at most " .. ns.db.maxQueries .. " item searches per auction house search")
-        wake()
+        markDirty() -- the lookup progress and the greyed rows follow the new cap at once
     else
-        ns.Print("/aj show | hide | toggle | status | debug [name text] | exact on|off | maxqueries <n>")
+        ns.Print("/aj show | hide | toggle | status | debug [name text] | exact on|off | maxqueries <n> | history")
     end
 end
 

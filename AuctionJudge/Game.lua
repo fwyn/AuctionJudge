@@ -14,9 +14,10 @@ local function isSecret(v)
     return ok and secret == true
 end
 
----The value, or nil when it is secret.
+---The value, or nil when it is secret. Checked before anything else touches it: even comparing a secret
+---value may fail.
 local function plain(v)
-    if v ~= nil and isSecret(v) then return nil end
+    if isSecret(v) then return nil end
     return v
 end
 Game.plain = plain
@@ -126,23 +127,47 @@ function Game.InstantEquipLoc(itemID)
     return equipLoc
 end
 
----{ name, link, quality, icon, equipLoc } for an item string, or nil while the item is not cached.
----equipLoc is nil when it cannot be read (missing, secret): unknown, not "not gear".
+---{ name, link, quality, icon, equipLoc, minLevel } for an item string or link, or nil while the item is
+---not cached. equipLoc is nil when it cannot be read (missing, secret): unknown, not "not gear". minLevel
+---(the level required to wear it) is nil when unknown.
 function Game.ItemInfo(itemString)
     local f = (C_Item and C_Item.GetItemInfo) or GetItemInfo
     if type(f) ~= "function" then return nil end
-    local ok, name, link, quality, _, _, _, _, _, equipLoc, icon = pcall(f, itemString)
+    local ok, name, link, quality, _, minLevel, _, _, _, equipLoc, icon = pcall(f, itemString)
     if not ok then return nil end
     name = plain(name)
     if type(name) ~= "string" or name == "" then return nil end
-    link, quality, equipLoc, icon = plain(link), plain(quality), plain(equipLoc), plain(icon)
+    link, quality, equipLoc, icon, minLevel = plain(link), plain(quality), plain(equipLoc), plain(icon), plain(minLevel)
     return {
         name = name,
         link = type(link) == "string" and link or nil,
         quality = type(quality) == "number" and quality or nil,
         equipLoc = type(equipLoc) == "string" and equipLoc or nil,
         icon = icon,
+        minLevel = type(minLevel) == "number" and minLevel or nil,
     }
+end
+
+-- The level PLAYER_LEVEL_UP announced: UnitLevel may still give the old one while that event runs.
+local levelUp
+
+---Notes the new level from PLAYER_LEVEL_UP (levels only go up in a session).
+function Game.NoteLevelUp(level)
+    level = plain(level)
+    if type(level) == "number" and level > (levelUp or 0) then levelUp = level end
+end
+
+---The player's level, or nil when unknown (no function, a failed call, a secret or non-positive value, and
+---no level-up seen). A level-up announced but not shown by UnitLevel yet wins.
+function Game.PlayerLevel()
+    local f, level = UnitLevel, nil
+    if type(f) == "function" then
+        local ok, v = pcall(f, "player")
+        v = ok and plain(v)
+        if type(v) == "number" and v > 0 then level = v end
+    end
+    if levelUp and (level == nil or level < levelUp) then return levelUp end
+    return level
 end
 
 ---------------------------------------------------------------------------
@@ -176,6 +201,18 @@ function Game.ItemKeyInfo(itemID, itemLevel, itemSuffix)
     end)
     if not ok2 or not out.name then return nil end
     return out
+end
+
+---The level a browse item key requires, from C_AuctionHouse.GetItemKeyRequiredLevel (what the Blizzard browse
+---list shows), or nil when unavailable. Zero means there is no level requirement. The key is
+---made from the values the row shows (its cheapest item level variant), not a saved browse key.
+function Game.ItemKeyRequiredLevel(itemID, itemLevel, itemSuffix)
+    local AH = C_AuctionHouse
+    if type(AH) ~= "table" or type(AH.GetItemKeyRequiredLevel) ~= "function" then return nil end
+    local ok, level = pcall(AH.GetItemKeyRequiredLevel, makeItemKey(itemID, itemLevel, itemSuffix))
+    level = ok and plain(level)
+    if type(level) == "number" and level >= 0 then return level end
+    return nil
 end
 
 Game.SEARCH_FUNCTIONS = { "SendSearchQuery", "GetNumItemSearchResults", "GetItemSearchResultInfo",

@@ -26,7 +26,7 @@ local BACKDROP = {
     insets = { left = 4, right = 4, top = 4, bottom = 4 },
 }
 
-local frame, toggle, title, countLine, emptyText, footer
+local frame, toggle, title, countLine, progressLine, emptyText, footer
 local headers, rows, checks = {}, {}, {}
 local offset, lastView = 0, nil
 
@@ -92,6 +92,11 @@ local function exactTip()
     return EXACT_TIP
 end
 
+-- The name cell, and the "Requires 15" label at the right end of the name column: the label has a width of
+-- its own and the name gives way while it is shown, so a long name never clips it.
+local NAME_X, NAME_W = COLS[1].x + 20, COLS[1].w - 20
+local LEVEL_W, LEVEL_GAP = 62, 4
+
 local function makeRow(i)
     local b = CreateFrame("Button", nil, frame)
     b:SetHeight(ROW_H)
@@ -108,14 +113,19 @@ local function makeRow(i)
     for _, col in ipairs(COLS) do
         local fs = text(b, "GameFontHighlightSmall", col.justify)
         if col.id == "name" then
-            fs:SetPoint("LEFT", b, "LEFT", col.x + 20, 0)
-            fs:SetWidth(col.w - 20)
+            fs:SetPoint("LEFT", b, "LEFT", NAME_X, 0)
+            fs:SetWidth(NAME_W)
         else
             fs:SetPoint("LEFT", b, "LEFT", col.x, 0)
             fs:SetWidth(col.w)
         end
         b.cells[col.id] = fs
     end
+    b.level = text(b, "GameFontHighlightSmall", "RIGHT")
+    b.level:SetPoint("LEFT", b, "LEFT", NAME_X + NAME_W - LEVEL_W, 0)
+    b.level:SetWidth(LEVEL_W)
+    b.level:SetTextColor(M.COLOR.bad[1], M.COLOR.bad[2], M.COLOR.bad[3])
+    b.level:Hide()
     b:SetScript("OnEnter", function(self)
         if not self.row then return end
         local link, why = self.row.link, self.scanReason
@@ -161,9 +171,14 @@ local function create(ah)
     close:SetPoint("TOPRIGHT", frame, "TOPRIGHT", -2, -2)
     close:SetScript("OnClick", function() ns.SetShown(false) end)
 
+    -- two short lines between the title and the checkboxes: the counts, then the lookup progress and the
+    -- incomplete-browse notice
     countLine = text(frame, "GameFontHighlightSmall")
-    countLine:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -30)
+    countLine:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -25)
     countLine:SetWidth(WIDTH - 20)
+    progressLine = text(frame, "GameFontDisableSmall")
+    progressLine:SetPoint("TOPLEFT", frame, "TOPLEFT", 10, -37)
+    progressLine:SetWidth(WIDTH - 20)
 
     -- 3 x (22 box + 2 + label) in 404 px: 8 + 24 + 96, 132 + 24 + 96, 256 + 24 + 128 = 408
     makeCheck("upgradesOnly", "Upgrades only", 8, 96)
@@ -218,8 +233,10 @@ function Panel.Scroll(delta)
 end
 
 ---Draws a row. A row waiting to be scanned (its score only the starred base score) is greyed: name,
----icon, upgrade and value; the price keeps its colour.
-local function fill(b, row, scan)
+---icon, upgrade and value; the price keeps its colour. A row above the player's level is labelled
+---"Requires 15" in red beside its name (the name itself, its search and its link stay as they are).
+---playerLevel: read once per redraw by Refresh, nil when unknown.
+local function fill(b, row, scan, playerLevel)
     b.row = row
     local why = M.ScanState(row, scan or { on = true })
     b.scanReason = why
@@ -229,6 +246,10 @@ local function fill(b, row, scan)
     local c = b.cells
     c.name:SetText(row.name or row.itemString)
     c.name:SetTextColor(q[1], q[2], q[3])
+    local need = M.LevelText(row, playerLevel)
+    b.level:SetText(need or "")
+    b.level:SetShown(need ~= nil)
+    c.name:SetWidth(need and (NAME_W - LEVEL_W - LEVEL_GAP) or NAME_W)
     c.price:SetText(Game.CoinText(row.price) .. (row.bid and " bid" or ""))
     local up, key = M.FormatUpgrade(row)
     c.upgrade:SetText(up)
@@ -238,7 +259,7 @@ local function fill(b, row, scan)
     b:Show()
 end
 
----view: { sgj = "ok" | "missing", ready, spec, counts, full, list, opts }
+---view: { sgj = "ok" | "missing", ready, spec, counts, full, scan, list, opts }
 function Panel.Refresh(view)
     if not frame then return end
     lastView = view
@@ -265,11 +286,14 @@ function Panel.Refresh(view)
     local list = view.list
     if view.sgj ~= "ok" then
         countLine:SetText("Sharpie's Gear Judge is not loaded: nothing to judge.")
+        progressLine:SetText("")
         list = {}
     elseif not view.ready then
-        countLine:SetText("Waiting for Sharpie's Gear Judge to finish loading. " .. M.CountLine(view.counts, view.full, view.exact))
+        countLine:SetText("Waiting for Sharpie's Gear Judge to finish loading.")
+        progressLine:SetText(M.CountLine(view.counts))
     else
-        countLine:SetText(M.CountLine(view.counts, view.full, view.exact))
+        countLine:SetText(M.CountLine(view.counts))
+        progressLine:SetText(M.ProgressLine(view.counts, view.full, view.scan))
     end
 
     local total = #list
@@ -277,10 +301,11 @@ function Panel.Refresh(view)
     if maxOffset < 0 then maxOffset = 0 end
     if offset > maxOffset then offset = maxOffset end
     if offset < 0 then offset = 0 end
+    local level = Game.PlayerLevel() -- once per redraw, for the "Requires 15" labels
     for i, b in ipairs(rows) do
         local row = list[offset + i]
         if row then
-            fill(b, row, view.scan)
+            fill(b, row, view.scan, level)
         else
             b.row = nil
             b:Hide()

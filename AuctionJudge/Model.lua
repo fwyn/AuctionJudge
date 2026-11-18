@@ -184,9 +184,11 @@ end
 ---link; for a random suffix group only the base item) and the item key info ({ name, quality, icon } or
 ---nil: the group's suffixed name). A random suffix group is approximate: a browse row is a group of
 ---auctions whose stats vary, and the item key has no exact link. Its base score stands in until the
----group's auctions are read (SetAuctions).
-function M.MergeInfo(base, keyInfo, suffix)
+---group's auctions are read (SetAuctions). The required level (minLevel) is the item key's (keyLevel, read
+---for the row's item level variant itemLevel) when the client gives one, else the base item's.
+function M.MergeInfo(base, keyInfo, suffix, keyLevel, itemLevel)
     keyInfo = keyInfo or {}
+    local keyed = type(keyLevel) == "number"
     return {
         name = keyInfo.name or base.name,
         link = base.link,
@@ -194,6 +196,9 @@ function M.MergeInfo(base, keyInfo, suffix)
         quality = keyInfo.quality or base.quality,
         icon = keyInfo.icon or base.icon,
         equipLoc = base.equipLoc,
+        minLevel = keyed and keyLevel or base.minLevel,
+        minLevelSource = keyed and "key" or "item",
+        minLevelItemLevel = keyed and itemLevel or nil,
         approximate = (tonumber(suffix) or 0) ~= 0,
     }
 end
@@ -218,8 +223,11 @@ function M.LinkSourceCounts(store)
 end
 
 ---Item info arrived for a row (from the game or the cache). Applies a cached score when there is one.
----info: { name, link, quality, icon, equipLoc }. equipLoc nil means unknown (unreadable): the row stays
----pending for a bounded retry and nothing is cached.
+---info: { name, link, quality, icon, equipLoc, minLevel, minLevelSource }. equipLoc nil means unknown
+---(unreadable): the row stays pending for a bounded retry and nothing is cached. minLevel nil means the
+---required level is unknown; minLevelSource says where a known one came from: "item" (the default: the
+---item info of the row's item string), "key" (the browse item key, read for item level minLevelItemLevel)
+---or "link" (an auction row's own link, see SetMinLevel).
 function M.ApplyInfo(store, row, info, now)
     if info.equipLoc == nil then
         M.Defer(store, row, now or 0, "EQUIP_LOC_UNKNOWN")
@@ -233,6 +241,9 @@ function M.ApplyInfo(store, row, info, now)
     row.linkSource = info.linkSource or "iteminfo"
     row.approximate = info.approximate == true
     row.sortName = type(info.name) == "string" and info.name:lower() or ""
+    row.minLevel = type(info.minLevel) == "number" and info.minLevel or nil
+    row.minLevelSource = row.minLevel and (info.minLevelSource or "item") or nil
+    row.minLevelItemLevel = row.minLevelSource == "key" and info.minLevelItemLevel or nil
     if not M.IsGear(info.equipLoc) then
         setState(store, row, "notgear")
         row.reason = "EQUIP_LOC"
@@ -314,6 +325,9 @@ function M.Rebuild(store, entries, skipped)
         end
     end
     for _, row in ipairs(rows) do
+        if row.minLevelSource == "key" and row.minLevelItemLevel ~= row.itemLevel then
+            row.minLevel, row.minLevelSource, row.minLevelItemLevel, row.levelMisses = nil, nil, nil, nil
+        end
         if row.state == "scored" then row.value = M.Value(row.upgradePct, row.price) end
     end
     store.rows, store.byKey, store.byItem = rows, byKey, byItem
@@ -366,6 +380,8 @@ end
 ---is listed as one row per distinct item (ItemIdentity), with the lowest-priced auction's link (price is
 ---the buyout, else the bid, then marked bid; at the same price a buyout wins) and the number of auctions
 ---merged (shown in /aj debug and the dump only). Each row is judged by its own link; rows take item info from the group and cached scores.
+---The required level is the one read from the auction's own link before (SetMinLevel, kept in the item info
+---cache), else unknown until it is read: the group's level is not the auction's.
 ---Returns the number of auction rows.
 function M.SetAuctions(store, group, results)
     local byId, order = {}, {}
@@ -400,9 +416,12 @@ function M.SetAuctions(store, group, results)
                 itemLevel = group.itemLevel, itemString = a.link, isAuction = true, group = group, identity = id,
                 state = "pending", tries = 0, nextTry = 0 }
             row.price = a.price
+            local known = store.info[a.link]
+            local exact = known and known.minLevelSource == "link" and known.minLevel or nil
             M.ApplyInfo(store, row, {
                 name = M.LinkName(a.link) or group.name, link = a.link, linkSource = "auction",
                 quality = group.quality, icon = group.icon, equipLoc = group.equipLoc,
+                minLevel = exact, minLevelSource = "link",
             })
         end
         row.price, row.bid, row.auctionCount = a.price, a.bid, a.count
@@ -412,6 +431,58 @@ function M.SetAuctions(store, group, results)
     group.auctions = rows
     recount(store)
     return #rows
+end
+
+M.MAX_LEVEL_MISSES = 3 -- reads of a row's readable item data that still gave no required level
+
+---A required level read later (LevelWanted): source "link" (an auction row's own link), "key" (the browse
+---item key, for item level itemLevel) or "item" (the item info). Kept in the item info cache of the row's
+---item string, so later searches start with it. nil (not readable) changes nothing. true when it was set.
+function M.SetMinLevel(store, row, level, source, itemLevel)
+    if type(level) ~= "number" then return false end
+    source = source or (row.isAuction and "link" or "item")
+    local at = source == "key" and itemLevel or nil
+    row.minLevel, row.minLevelSource, row.minLevelItemLevel = level, source, at
+    local cached = store.info[row.itemString]
+    if cached then cached.minLevel, cached.minLevelSource, cached.minLevelItemLevel = level, source, at end
+    return true
+end
+
+---true when a row's required level should be read (again): it is unknown (delayed or unreadable item data,
+---an auction link not read yet, a cached row from an earlier search), or it came from the item key of
+---another item level variant than the row shows now. Not after MAX_LEVEL_MISSES readable reads without one.
+function M.LevelWanted(row)
+    if not row.info or row.state == "notgear" or (row.levelMisses or 0) >= M.MAX_LEVEL_MISSES then return false end
+    if row.minLevel == nil then return true end
+    return row.minLevelSource == "key" and row.minLevelItemLevel ~= row.itemLevel
+end
+
+---The rows of an item: its browse rows and their auction rows.
+function M.ItemRows(store, itemID)
+    local out = {}
+    for _, row in ipairs(store.byItem[tonumber(itemID) or 0] or {}) do
+        out[#out + 1] = row
+        for _, a in ipairs(row.auctions or {}) do out[#out + 1] = a end
+    end
+    return out
+end
+
+---true when the row's required level is its own item's: a fixed-stat item, the browse item key's (what the
+---auction house itself shows for the row), or an auction row's own link. A random suffix group's base item
+---level is a guess: its auctions' own links may need another level.
+function M.LevelConfirmed(row)
+    local s = row.minLevelSource
+    if s == "link" or s == "key" then return true end
+    return s == "item" and not row.approximate
+end
+
+---"Requires 15" when the row needs a higher level than the player's, "Requires 15?" when that level is only
+---a guess (LevelConfirmed), else nil (also when either level is unknown). Only a label: such rows are not
+---unusable, the player grows into them.
+function M.LevelText(row, playerLevel)
+    local need = row.minLevel
+    if type(need) ~= "number" or type(playerLevel) ~= "number" or need <= playerLevel then return nil end
+    return format("Requires %d", need) .. (M.LevelConfirmed(row) and "" or "?")
 end
 
 ---Exact mode on: groups whose auctions were read are listed as their auction rows; off: as their own
@@ -459,13 +530,26 @@ end
 ---Query states of random suffix groups: done means resolved, failed or timed out.
 local QUERY_DONE = { resolved = true, failed = true, timeout = true }
 
+---Counts of the listed rows. upgrades = confirmedUpgrades (a fixed-stat item or an auction row: an exact
+---score) + estimatedUpgrades (a random suffix group listed with its starred base score). A group whose base
+---score is not an upgrade is in neither, but is still looked up: its auctions may be. groups: random suffix
+---gear groups; groupsDone: their item search finished (resolved, failed or timed out); groupsResolved: it
+---returned auctions (checked; not necessarily every auction of the group).
 function M.Counts(store)
-    local c = { total = #store.rows, gear = 0, upgrades = 0, pending = 0, scored = 0, unusable = 0, error = 0,
-        notgear = 0, resolving = 0, groups = 0, groupsDone = 0 }
+    local c = { total = #store.rows, gear = 0, upgrades = 0, confirmedUpgrades = 0, estimatedUpgrades = 0,
+        pending = 0, scored = 0, unusable = 0, error = 0, notgear = 0, resolving = 0, groups = 0, groupsDone = 0,
+        groupsResolved = 0, groupsAwaitingInfo = 0 }
     for _, row in ipairs(store.rows) do
-        if (row.suffix or 0) ~= 0 and row.info and row.state ~= "notgear" and row.state ~= "unusable" then
+        if (row.suffix or 0) ~= 0 and not row.info and row.state == "pending" then
+            c.groupsAwaitingInfo = c.groupsAwaitingInfo + 1
+        elseif (row.suffix or 0) ~= 0 and row.info and row.state ~= "notgear" and row.state ~= "unusable" then
             c.groups = c.groups + 1
-            if row.auctions or (row.query and QUERY_DONE[row.query.state]) then c.groupsDone = c.groupsDone + 1 end
+            local qs = row.query and row.query.state
+            if row.auctions or qs == "resolved" then
+                c.groupsDone, c.groupsResolved = c.groupsDone + 1, c.groupsResolved + 1
+            elseif QUERY_DONE[qs] then
+                c.groupsDone = c.groupsDone + 1
+            end
         end
     end
     for _, row in ipairs(store.leaves) do
@@ -484,7 +568,14 @@ function M.Counts(store)
                 c.pending = c.pending + 1
             elseif s == "scored" then
                 c.scored = c.scored + 1
-                if row.upgradePct > 0 then c.upgrades = c.upgrades + 1 end
+                if row.upgradePct > 0 then
+                    c.upgrades = c.upgrades + 1
+                    if row.approximate and not row.isAuction then
+                        c.estimatedUpgrades = c.estimatedUpgrades + 1
+                    else
+                        c.confirmedUpgrades = c.confirmedUpgrades + 1
+                    end
+                end
             elseif s == "unusable" then
                 c.unusable = c.unusable + 1
             else
@@ -544,6 +635,8 @@ function M.DumpRow(row, opts)
         linkSource = row.linkSource, approximate = row.approximate == true, sgjLink = row.sgjLink,
         auction = row.isAuction == true, group = row.group and row.group.key or nil, bid = row.bid == true,
         auctionCount = row.auctionCount, identity = row.identity, query = M.QueryText(row),
+        minLevel = row.minLevel, minLevelSource = row.minLevelSource, minLevelItemLevel = row.minLevelItemLevel,
+        levelMisses = row.levelMisses,
     }
 end
 
@@ -761,17 +854,61 @@ end
 
 local function plural(n, one, many) return format("%d %s", n, n == 1 and one or many) end
 
----"37 gear items, 9 upgrades, 4 pending", with ", resolving 5/23" while random suffix groups are still
----waiting for their auctions (exact mode).
-function M.CountLine(c, full, exact)
+local DOT = " \194\183 " -- " · "
+
+---The summary line: "498 gear items · 60 confirmed upgrades · 370 estimated · 4 pending". Confirmed: an exact
+---score; estimated: random suffix groups whose starred base score is an upgrade (shown only when there are
+---any). An estimate is neither a lower nor an upper bound: groups whose base score is not an upgrade are
+---looked up too.
+function M.CountLine(c)
     if c.total == 0 then return "No browse results yet: search the auction house." end
-    local line = plural(c.gear, "gear item", "gear items") .. ", " .. plural(c.upgrades, "upgrade", "upgrades")
-        .. ", " .. c.pending .. " pending"
-    if exact and (c.groups or 0) > 0 and c.groupsDone < c.groups then
-        line = line .. ", resolving " .. c.groupsDone .. "/" .. c.groups
+    local estimated = c.estimatedUpgrades or 0
+    return plural(c.gear, "gear item", "gear items") .. DOT
+        .. plural(c.confirmedUpgrades or 0, "confirmed upgrade", "confirmed upgrades")
+        .. (estimated > 0 and (DOT .. estimated .. " estimated") or "") .. DOT .. c.pending .. " pending"
+end
+
+---Where the item searches for random suffix groups stand. lookup (Core's view.scan): { on = the setting,
+---active = searches can go out, disabled = why not this session, cap, sent = this search, inflight }.
+---  nil        nothing to look up, the setting is off, or nothing can be judged (SGJ missing)
+---  disabled   the setting is on but the search API is missing or failed this session
+---  pending    remaining groups are waiting for item info before they can be judged for lookup
+---  complete   every group's search finished (some may have failed)
+---  stopped    the cap is used up with groups left and nothing in flight (also a cap of 0)
+---  looking    searches go on (queued, held, spaced, throttled, or the last one allowed in flight)
+function M.LookupState(c, lookup)
+    local groups, awaiting = c.groups or 0, c.groupsAwaitingInfo or 0
+    if not (lookup and lookup.on) or (groups == 0 and awaiting == 0) then return nil end
+    if lookup.disabled then return "disabled" end
+    if not lookup.active then return nil end
+    if (c.groupsDone or 0) >= groups then return awaiting > 0 and "pending" or "complete" end
+    if not lookup.inflight and (lookup.sent or 0) >= (lookup.cap or huge) then return "stopped" end
+    return "looking"
+end
+
+---The progress line under the summary: the item search state and the incomplete-browse notice, e.g.
+---"Lookup limit 60 reached: 12/23 checked, 1 failed; more results not loaded", "Lookups complete: 18/18
+---checked". "" when there is nothing to say. Checked: the group's item search returned auctions (it may not have listed every auction); failed:
+---it timed out or could not be sent. Neither counts the other.
+function M.ProgressLine(c, full, lookup)
+    local parts = {}
+    local state = M.LookupState(c, lookup)
+    local checked, groups = c.groupsResolved or 0, c.groups or 0
+    local failed = (c.groupsDone or 0) - checked
+    local progress = checked .. "/" .. groups .. " checked" .. (failed > 0 and (", " .. failed .. " failed") or "")
+    if state == "disabled" then
+        parts[1] = "Lookup not available: " .. tostring(lookup.disabled)
+    elseif state == "pending" then
+        parts[1] = "Waiting for item info"
+    elseif state == "stopped" then
+        parts[1] = "Lookup limit " .. (lookup.cap or 0) .. " reached: " .. progress
+    elseif state == "looking" then
+        parts[1] = "Checking random-stat items: " .. progress
+    elseif state == "complete" then
+        parts[1] = "Lookups complete: " .. progress
     end
-    if full == false then line = line .. " (more results not loaded)" end
-    return line
+    if full == false then parts[#parts + 1] = #parts == 0 and "More results not loaded" or "more results not loaded" end
+    return table.concat(parts, "; ")
 end
 
 M.COLUMN_LABEL = { name = "Item", price = "Price", upgrade = "Upgrade", value = "Value" }

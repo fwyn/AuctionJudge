@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The panel separates confirmed upgrades from estimates and shows when the lookup limit has been reached.
+- Gear above the character's level shows its required level in the item list.
+- `/aj history` shows a short summary of each of the last 20 searches.
+
 ## 1.0.0
 
 First release.

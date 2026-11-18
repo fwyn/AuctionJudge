@@ -28,12 +28,19 @@ For World of Warcraft Forever.
 
 Options in the panel:
 
-- **Upgrades only** - hide items that are not an upgrade.
-- **Hide unusable** - hide items your character cannot use.
+- **Upgrades only** - show positive scores. The panel counts confirmed upgrades separately from
+  positive estimates. A group with a negative base estimate can still contain an upgrade,
+  so it remains eligible for a lookup even when this filter hides it.
+- **Hide unusable** - hide items Sharpie's Gear Judge rules out for your character. Gear you can
+  grow into stays in the list. For example, a level 10 character sees **Requires 15** on a row
+  for an item that requires level 15. A question mark means the level comes from the base item
+  while the requirement for that random-stat group is still unknown.
 - **Scan specific items** - items with random stats ("of the Bear", "of Intellect", ...) are sold in
   groups whose stats differ, so they can only be judged exactly by looking at the individual
   auctions. With this option on, AuctionJudge looks those up for you. Until an item has been looked
-  up it is shown greyed out with its base score marked `*`.
+  up it is shown greyed out with its base score marked `*`. Scan progress shows how many groups
+  have been checked and whether the lookup limit stopped the scan. If the auction house has more
+  browse results to load, the panel reports that separately.
 
 The panel can be closed with its close button; a small "AJ" button on the auction house window
 brings it back.
@@ -55,6 +62,9 @@ brings it back.
 - `exact on|off` - same as the "Scan specific items" checkbox.
 - `maxqueries <n>` - the most item lookups per search (default 60).
 - `status` - what the addon found and what it is doing.
+- `history` - summaries of the last 20 searches across the account, including the result count,
+  exact lookups, confirmed upgrades and how the scan ended. Only the most recent useful search
+  keeps detailed rows for debugging.
 - `debug [text]` - details per row, for troubleshooting.
 
 ## Notes

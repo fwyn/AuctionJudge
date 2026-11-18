@@ -15,7 +15,7 @@ from lupa import lua51
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ADDON = ROOT / "AuctionJudge"
 TESTS = ROOT / "tests"
-SUITES = ["test_model.lua", "test_queue.lua", "smoke.lua"]
+SUITES = ["test_model.lua", "test_queue.lua", "test_level.lua", "smoke.lua"]
 
 
 def runtime():

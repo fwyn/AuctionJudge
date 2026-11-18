@@ -12,4 +12,5 @@ Model.lua
 Queue.lua
 Game.lua
 Panel.lua
+History.lua
 Core.lua

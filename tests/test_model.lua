@@ -556,12 +556,10 @@ test("auctions: one row per distinct link, lowest price kept, bid-only marked, c
     eq(store.pending, 2, "two auction rows pending")
     eq(#M.NextBatch(store, 0, 20), 2, "and due")
     local c = M.Counts(store)
-    eq(c.gear .. " " .. c.groups .. " " .. c.groupsDone, "4 1 1", "counts: leaves, groups done")
-    eq(M.CountLine(c, true, true), "4 gear items, 2 upgrades, 2 pending", "nothing left resolving")
-    eq(M.CountLine({ total = 3, gear = 3, upgrades = 1, pending = 0, groups = 23, groupsDone = 5 }, true, true),
-        "3 gear items, 1 upgrade, 0 pending, resolving 5/23", "resolving part")
-    eq(M.CountLine({ total = 3, gear = 3, upgrades = 1, pending = 0, groups = 23, groupsDone = 5 }, true, false),
-        "3 gear items, 1 upgrade, 0 pending", "not in exact mode")
+    eq(c.gear .. " " .. c.groups .. " " .. c.groupsDone .. " " .. c.groupsResolved, "4 1 1 1",
+        "counts: leaves, groups done and checked")
+    eq(c.upgrades .. " " .. c.confirmedUpgrades .. " " .. c.estimatedUpgrades, "2 2 0", "auction rows are confirmed")
+    eq(M.CountLine(c), "4 gear items \194\183 2 confirmed upgrades \194\183 2 pending", "count line")
 
     -- the same results again (more results added): rows kept
     local first = a[1]
@@ -658,14 +656,102 @@ test("count line", function()
         { itemID = 7 }, { itemID = 8 }, { itemID = 9, equipLoc = "" } })
     local c = M.Counts(store)
     eq(c.gear, 7, "gear")
-    eq(c.upgrades, 3, "upgrades")
+    eq(c.upgrades .. " " .. c.confirmedUpgrades .. " " .. c.estimatedUpgrades, "3 3 0", "upgrades: all fixed-stat")
     eq(c.pending, 2, "pending: one to score, one to resolve")
     eq(c.resolving, 1, "resolving")
     eq(c.notgear, 1, "not gear")
-    eq(M.CountLine(c, true), "7 gear items, 3 upgrades, 2 pending", "line")
-    eq(M.CountLine({ total = 1, gear = 1, upgrades = 1, pending = 0 }), "1 gear item, 1 upgrade, 0 pending", "singular")
-    eq(M.CountLine(c, false), "7 gear items, 3 upgrades, 2 pending (more results not loaded)", "partial")
+    local D = " \194\183 "
+    eq(M.CountLine(c), "7 gear items" .. D .. "3 confirmed upgrades" .. D .. "2 pending", "line")
+    eq(M.CountLine({ total = 1, gear = 1, confirmedUpgrades = 1, estimatedUpgrades = 0, pending = 0 }),
+        "1 gear item" .. D .. "1 confirmed upgrade" .. D .. "0 pending", "singular")
+    eq(M.CountLine({ total = 498, gear = 498, confirmedUpgrades = 60, estimatedUpgrades = 370, pending = 4 }),
+        "498 gear items" .. D .. "60 confirmed upgrades" .. D .. "370 estimated" .. D .. "4 pending",
+        "both labelled")
+    eq(M.ProgressLine(c, false), "More results not loaded", "partial browse, nothing to look up")
+    eq(M.ProgressLine(c, true), "", "nothing to say")
     eq(M.CountLine({ total = 0 }), "No browse results yet: search the auction house.", "empty")
+end)
+
+test("lookup progress: checking, in flight at the cap, stopped, complete, disabled, off", function()
+    local c = { groups = 23, groupsDone = 6, groupsResolved = 5 }
+    local function lookup(x)
+        local l = { on = true, active = true, cap = 60, sent = 6, inflight = false }
+        for k, v in pairs(x or {}) do l[k] = v end
+        return l
+    end
+    eq(M.ProgressLine(c, true, lookup()), "Checking random-stat items: 5/23 checked, 1 failed", "checking")
+    eq(M.ProgressLine(c, false, lookup()), "Checking random-stat items: 5/23 checked, 1 failed; more results not loaded",
+        "with the incomplete-browse notice")
+    -- the last search allowed is still out: not stopped yet
+    eq(M.LookupState(c, lookup({ cap = 6, inflight = true })), "looking", "final query in flight")
+    eq(M.ProgressLine(c, true, lookup({ cap = 6 })), "Lookup limit 6 reached: 5/23 checked, 1 failed", "stopped")
+    eq(M.ProgressLine({ groups = 3, groupsDone = 0, groupsResolved = 0 }, true, lookup({ cap = 0, sent = 0 })),
+        "Lookup limit 0 reached: 0/3 checked", "a cap of 0 stops at once")
+    -- complete is never labelled stopped, even with the cap used up
+    local done = { groups = 18, groupsDone = 18, groupsResolved = 18 }
+    eq(M.ProgressLine(done, true, lookup({ cap = 18, sent = 18 })), "Lookups complete: 18/18 checked", "complete")
+    eq(M.ProgressLine({ groups = 3, groupsDone = 3, groupsResolved = 2 }, true, lookup()),
+        "Lookups complete: 2/3 checked, 1 failed", "a timeout is not counted as checked")
+    eq(M.ProgressLine(c, true, lookup({ active = false, disabled = "SendSearchQuery missing" })),
+        "Lookup not available: SendSearchQuery missing", "disabled")
+    eq(M.ProgressLine(c, true, lookup({ on = false })), "", "setting off")
+    eq(M.ProgressLine({ groups = 0, groupsDone = 0, groupsResolved = 0 }, true, lookup()), "", "no groups")
+end)
+
+-- As seen in the game: a shield's random suffix group with a negative base score was a real upgrade once
+-- its auctions were read.
+test("a group whose base score is not an upgrade is still looked up and confirmed from its auctions", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 801, itemSuffix = 14315, minPrice = 1000 } })
+    local group = store.rows[1]
+    M.ApplyInfo(store, group, M.MergeInfo({ name = "Kite Shield", link = "|Hitem:801|h[Kite Shield]|h",
+        equipLoc = "INVTYPE_SHIELD" }, { name = "Kite Shield of Healing" }, 14315), 0)
+    M.ApplyScore(store, group, { upgradePct = -1.5 }, nil, 0)
+    local c = M.Counts(store)
+    eq(c.upgrades .. " " .. c.confirmedUpgrades .. " " .. c.estimatedUpgrades, "0 0 0", "base: no upgrade, no estimate")
+    eq(M.NeedsQuery(group), true, "still eligible for a lookup")
+    eq(#M.Filter(store, { upgradesOnly = true }), 0, "hidden under upgrades only meanwhile")
+    group.query = { state = "resolved" }
+    M.SetAuctions(store, group, { { link = "|Hitem:801::::::::15:1486:::1:12750::::::|h[Kite Shield of Healing]|h",
+        buyout = 1000 } })
+    M.ApplyScore(store, group.auctions[1], { upgradePct = 4 }, nil, 0)
+    c = M.Counts(store)
+    eq(c.upgrades .. " " .. c.confirmedUpgrades .. " " .. c.estimatedUpgrades .. " " .. c.groupsResolved, "1 1 0 1",
+        "the auction row is a confirmed upgrade")
+    eq(#M.Filter(store, { upgradesOnly = true }), 1, "listed under upgrades only")
+    -- exact view off: the group's base score is listed again, not an upgrade
+    M.SetExactView(store, false)
+    c = M.Counts(store)
+    eq(c.upgrades .. " " .. c.groupsResolved, "0 1", "base row again; the group stays checked")
+end)
+
+test("a positive base score of an unresolved group is an estimate, not a confirmed upgrade", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 14315, minPrice = 449 }, { itemID = 601, minPrice = 300 } })
+    M.ApplyInfo(store, store.rows[1], M.MergeInfo({ name = "Cadet Vest", link = "|Hitem:501|h[Cadet Vest]|h",
+        equipLoc = "INVTYPE_CHEST" }, { name = "Cadet Vest of Healing" }, 14315), 0)
+    M.ApplyScore(store, store.rows[1], { upgradePct = 2.5 }, nil, 0)
+    M.ApplyInfo(store, store.rows[2], info("Iron Helm", "INVTYPE_HEAD"), 0)
+    M.ApplyScore(store, store.rows[2], { upgradePct = 3 }, nil, 0)
+    local c = M.Counts(store)
+    eq(c.upgrades .. " " .. c.confirmedUpgrades .. " " .. c.estimatedUpgrades, "2 1 1", "one each, total kept")
+    store.rows[1].query = { state = "timeout" }
+    c = M.Counts(store)
+    eq(c.groupsDone .. " " .. c.groupsResolved .. " " .. c.estimatedUpgrades, "1 0 1", "a timeout: done, not checked")
+end)
+
+test("lookup progress waits for an uncached suffix group before announcing completion", function()
+    local store = M.NewStore()
+    M.Rebuild(store, { { itemID = 501, itemSuffix = 10 }, { itemID = 502, itemSuffix = 11 } })
+    local first = store.rows[1]
+    M.ApplyInfo(store, first, info("Shield", "INVTYPE_SHIELD"), 0)
+    first.query = { state = "resolved" }
+    local scan = { on = true, active = true, sent = 1, cap = 60 }
+    local c = M.Counts(store)
+    eq(c.groupsAwaitingInfo, 1, "second group's eligibility still unknown")
+    eq(M.ProgressLine(c, true, scan), "Waiting for item info", "checking can still resume")
+    M.ApplyInfo(store, store.rows[2], info("Second shield", "INVTYPE_SHIELD"), 0)
+    eq(M.LookupState(M.Counts(store), scan), "looking", "second group eligible")
 end)
 
 return H

@@ -157,7 +157,10 @@ local function Client(opts)
             name, link = it.name, C.genericLink(id)
         end
         local loc = it.secretFull and C.SECRET or it.equipLoc
-        return name, link, it.quality or 2, 60, 55, "Armor", "Plate", 1, loc, "icon" .. id
+        -- required level: per auction link (it.linkLevels), per item (it.minLevel), else 55; "secret" unreadable
+        local minLevel = (it.linkLevels and it.linkLevels[link]) or it.minLevel or 55
+        if minLevel == "secret" then minLevel = C.SECRET end
+        return name, link, it.quality or 2, 60, minLevel, "Armor", "Plate", 1, loc, "icon" .. id
     end
 
     C.SECRET = setmetatable({}, { __tostring = function() return "<secret>" end })
@@ -196,6 +199,13 @@ local function Client(opts)
     G.BackdropTemplateMixin = {}
     G.GameTooltip = widget("GameTooltip")
     G.IsShiftKeyDown = function() return C.shift == true end
+    -- the player's level: C.playerLevel (default 60, above every item's default 55), "secret" unreadable
+    G.UnitLevel = function(unit)
+        count("UnitLevel")
+        if unit ~= "player" then return nil end
+        if C.playerLevel == "secret" then return C.SECRET end
+        return C.playerLevel or 60
+    end
     G.GetCoinTextureString = function(copper) return "coin:" .. copper end
     C.chatOpen = false
     G.ChatEdit_InsertLink = function(link)
@@ -233,6 +243,11 @@ local function Client(opts)
             return out
         end,
         HasFullBrowseResults = function() return C.full end,
+        -- optional, as in the Forever client: opts.keyLevels["id:itemLevel:suffix"]
+        GetItemKeyRequiredLevel = opts.keyLevels and function(key)
+            count("GetItemKeyRequiredLevel")
+            return opts.keyLevels[key.itemID .. ":" .. key.itemLevel .. ":" .. key.itemSuffix]
+        end or nil,
         MakeItemKey = function(id, ilvl, suffix)
             return { itemID = id, itemLevel = ilvl or 0, itemSuffix = suffix or 0, battlePetSpeciesID = 0 }
         end,
@@ -546,7 +561,7 @@ test("results arrive: gear kept, duplicates priced low, uncached items wait", fu
     ok(C.requested[103] and C.requested[104], "uncached items requested")
     eq(C.requested[203], nil, "the tabard is never requested")
     eq(C.rowNames(), "Lionheart Helm,Bandit's Cloak of the Bear", "upgrades by % per gold")
-    ok(C.hasText("^4 gear items, 2 upgrades, 2 pending$"), "count line")
+    ok(C.hasText("^4 gear items · 1 confirmed upgrade · 1 estimated · 2 pending$"), "count line")
 end)
 
 test("rows show quality colour, coin text, upgrade and value", function()
@@ -566,7 +581,7 @@ test("uncached items resolve on GET_ITEM_INFO_RECEIVED and get scored", function
     C.advance(0.5) -- one batch, then the next list refresh (at most 0.2 s later)
     eq(C.ns.store.byKey["103:0"].state, "scored", "robe scored")
     eq(C.rowNames(), "Heavy Boots,Lionheart Helm,Bandit's Cloak of the Bear,Robe of Frost", "by % per gold")
-    ok(C.hasText("^6 gear items, 4 upgrades, 0 pending$"), "count line")
+    ok(C.hasText("^6 gear items · 3 confirmed upgrades · 1 estimated · 0 pending$"), "count line")
 end)
 
 local function headerByLabel(label)
@@ -629,7 +644,8 @@ test("more results: scored under the batch limit, scrollable", function()
     C.advance(0.5)
     eq(C.calls.ScoreItem - before, 60, "the 60 new rows scored once each")
     eq(C.updaters(), 0, "nothing pending: work loop stopped")
-    ok(C.hasText("^66 gear items, 64 upgrades, 0 pending %(more results not loaded%)$"), "count line")
+    ok(C.hasText("^66 gear items · 63 confirmed upgrades · 1 estimated · 0 pending$"), "count line")
+    ok(C.hasText("^More results not loaded$"), "incomplete-browse notice on the second line")
     eq(#C.shownRows(), 20, "20 rows shown")
     eq(C.shownRows()[1].cells.name.text, "Heavy Boots", "top before scrolling")
     local p = C.panel()
@@ -683,7 +699,7 @@ test("SCORES_CHANGED rescores everything", function()
     for _, fn in ipairs(C.sgjCallbacks) do fn() end
     C.advance(0.2) -- a redraw at most 0.2 s away; 66 rows take four batches
     local pending
-    for _, t in ipairs(C.texts()) do pending = pending or tonumber(t:match("^%d+ gear items, %d+ upgrades, (%d+) pending")) end
+    for _, t in ipairs(C.texts()) do pending = pending or tonumber(t:match("^%d+ gear items .- (%d+) pending$")) end
     ok(pending and pending > 0, "pending while rescoring: " .. tostring(pending))
     C.advance(1)
     eq(C.calls.ScoreItem - before, 66, "every gear row scored again")
@@ -712,9 +728,10 @@ test("slash commands", function()
     ok(C.printedSince(n, "SGJ API: IsReady ok, ScoreItem ok, RegisterCallback ok, GetSpec ok, GetVersion ok; "
         .. "SCORES_CHANGED registered yes"), "API line")
     ok(C.printedSince(n, "Auction house: open; last browse results 72 %(all loaded: no%)"), "browse line")
-    ok(C.printedSince(n, "Rows: 69 listed from 69 browse rows %(gear 66, upgrades 64; scored 65, pending 0 of which "
-        .. "resolving 0, unusable 1, error 0, not gear 3%)"), "rows line")
-    ok(C.printedSince(n, "Exact scores: off; random suffix groups 1, done 0; queue 0 queued, 0 sent"), "exact line")
+    ok(C.printedSince(n, "Rows: 69 listed from 69 browse rows %(gear 66, upgrades 64: confirmed 63, estimated 1; "
+        .. "scored 65, pending 0 of which resolving 0, unusable 1, error 0, not gear 3%)"), "rows line")
+    ok(C.printedSince(n, "Exact scores: off; random suffix groups 1, done 0 %(checked 0%); lookups %-; queue 0 queued, "
+        .. "0 sent"), "exact line")
     ok(C.printedSince(n, "sort Value descending"), "panel line")
     n = #C.printed
     C.slash("debug")
@@ -892,14 +909,15 @@ local function exactSession(xopts)
         [601] = { name = "Iron Helm", quality = 2, equipLoc = "INVTYPE_HEAD", cached = true },
         [701] = { name = "Plate Vest", quality = 2, equipLoc = "INVTYPE_CHEST", cached = true },
     }
-    local X = Client({ items = list, sgj = EXACT_PCT, auctions = AUCTIONS, noReply = xopts.noReply,
+    local X = Client({ items = xopts.items or list, sgj = xopts.sgj or EXACT_PCT, auctions = xopts.auctions or AUCTIONS,
+        noReply = xopts.noReply,
         noSearchAPI = xopts.noSearchAPI, searchErrors = xopts.searchErrors })
     X.throttleReady = xopts.throttle ~= false
     X.load()
     X.fire("ADDON_LOADED", "AuctionJudge")
     if xopts.slash then X.slash(xopts.slash) end
     X.openAH()
-    X.results = { result(501, 449, HEALING), result(501, 50000, WHALE), result(501, 155000, INTELLECT),
+    X.results = xopts.results or { result(501, 449, HEALING), result(501, 50000, WHALE), result(501, 155000, INTELLECT),
         result(601, 30000), result(701, 1000, HEALING) }
     X.browseAt = X.clock
     X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
@@ -921,6 +939,18 @@ end
 
 local function countLine(X)
     for _, t in ipairs(X.texts()) do if t:find("gear item") then return t end end
+end
+
+-- the line under the count line: lookup progress and the incomplete-browse notice
+local function progressLine(X)
+    local after = false
+    for _, c in ipairs(X.panel().children) do
+        if c.kind == "FontString" then
+            local t = rawget(c, "text")
+            if after then return t or "" end
+            after = t ~= nil and t:find("gear item") ~= nil
+        end
+    end
 end
 
 local function clean(X)
@@ -957,7 +987,8 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     click(rows[1])
     eq(X.searched, "Cadet Vest of Healing", "auction row: search by its full name")
     eq(healing.auctions[1].sgjLink, H1, "SGJ judged the auction's link")
-    eq(countLine(X), "6 gear items, 5 upgrades, 0 pending", "count line, nothing left resolving")
+    eq(countLine(X), "6 gear items · 5 confirmed upgrades · 0 pending", "count line, all confirmed")
+    eq(progressLine(X), "Lookups complete: 3/3 checked", "completion confirmed with the group count")
     eq(X.updaters(), 0, "idle once done")
     local n = #X.printed
     X.slash("debug healing")
@@ -965,8 +996,8 @@ test("exact: random suffix groups replaced by their auctions, each judged by its
     ok(X.printedSince(n, "auction of group 501:" .. HEALING .. " %(2 auctions of this item%)"), "auction line")
     n = #X.printed
     X.slash("status")
-    ok(X.printedSince(n, "Exact scores: on; random suffix groups 3, done 3; queue 0 queued, 3 sent this search %(max 60%), "
-        .. "0 failed"), "status queue line")
+    ok(X.printedSince(n, "Exact scores: on; random suffix groups 3, done 3 %(checked 3%); lookups complete; queue 0 queued, "
+        .. "3 sent this search %(max 60%), 0 failed"), "status queue line")
     ok(X.printedSince(n, "Item search API: SendSearchQuery ok, GetNumItemSearchResults ok, GetItemSearchResultInfo ok, "
         .. "HasFullItemSearchResults ok, IsThrottledMessageSystemReady ok; sort Buyout"), "status API line")
 
@@ -1013,7 +1044,8 @@ test("exact: nothing is searched while the throttle is not ready", function()
     eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score. Waiting to be looked up", "tooltip reason")
     helm.scripts.OnEnter(helm)
     eq(#X.G.GameTooltip.lines, 0, "no extra line for an exact row")
-    ok(countLine(X):find(", resolving 0/3$"), "count line: " .. countLine(X))
+    eq(countLine(X), "5 gear items · 1 confirmed upgrade · 3 estimated · 0 pending", "starred groups are estimates")
+    eq(progressLine(X), "Checking random-stat items: 0/3 checked", "progress")
     local n = #X.printed
     X.slash("status")
     ok(X.printedSince(n, "waiting: throttle"), "status says why")
@@ -1038,9 +1070,22 @@ test("exact: browse events hold the queue; a new search cancels it; the cap hold
     X.advance(3)
     eq(#X.searches, 1, "cap: still one search")
     eq(X.updaters(), 0, "capped: idle")
-    ok(countLine(X):find(", resolving 1/3$"), "count line: " .. countLine(X))
+    eq(countLine(X), "6 gear items · 3 confirmed upgrades · 2 estimated · 0 pending", "count line")
+    eq(progressLine(X), "Lookup limit 1 reached: 1/3 checked", "stopped at the cap")
     local capped = X.shownRows()[#X.shownRows()]
     eq(capped.scanReason, "Not looked up (limit reached)", "over the cap: greyed with the reason")
+    -- the cap changed while the queue is parked on the throttle: the panel follows at once
+    X.throttleReady = false
+    X.slash("maxqueries 2")
+    X.advance(0.3)
+    eq(progressLine(X) .. " / " .. tostring(X.shownRows()[#X.shownRows()].scanReason),
+        "Checking random-stat items: 1/3 checked / Waiting to be looked up", "raised: no longer stopped")
+    eq(#X.searches, 1, "nothing sent under the throttle")
+    X.slash("maxqueries 1")
+    X.advance(0.3) -- the list redraws at most 5 times a second
+    eq(progressLine(X) .. " / " .. tostring(X.shownRows()[#X.shownRows()].scanReason),
+        "Lookup limit 1 reached: 1/3 checked / Not looked up (limit reached)", "lowered again: stopped")
+    X.throttleReady = true
     -- a new search: queue cancelled, the cap starts again
     X.slash("maxqueries 60")
     X.results = { result(501, 50000, WHALE) }
@@ -1089,7 +1134,9 @@ test("exact: a query without results times out; the queue goes on", function()
     ok(X.searches[2].at - X.searches[1].at >= 5 - 1e-9, "the next one after the timeout")
     local n = #X.printed
     X.slash("status")
-    ok(X.printedSince(n, "random suffix groups 3, done 3; queue 0 queued, 3 sent this search %(max 60%), 1 failed"), "status")
+    ok(X.printedSince(n, "random suffix groups 3, done 3 %(checked 2%); lookups complete; queue 0 queued, 3 sent this "
+        .. "search %(max 60%), 1 failed"), "status")
+    eq(progressLine(X), "Lookups complete: 2/3 checked, 1 failed", "the timeout is not counted as checked")
     X.closeAH()
     eq(X.G.AuctionJudgeDB.lastDump.groups[1].query, "timeout", "dump")
     clean(X)
@@ -1105,6 +1152,7 @@ test("exact: missing item search API disables it for the session; base scores st
     X.slash("status")
     ok(X.printedSince(n, "Exact scores: on but inactive %(disabled: SendSearchQuery missing%)"), "status")
     ok(X.printedSince(n, "Item search API: SendSearchQuery MISSING"), "API line")
+    eq(progressLine(X), "Lookup not available: SendSearchQuery missing", "progress line")
     eq(X.updaters(), 0, "idle")
     X.closeAH()
     clean(X)
@@ -1252,11 +1300,56 @@ test("Scan specific items checkbox is greyed with the reason when the search fun
     clean(X)
 end)
 
+test("exact: the last query allowed in flight is not stopped; a cap of 0 is; toggling keeps the cap", function()
+    local X = exactSession({ slash = "maxqueries 1", noReply = { ["501:" .. HEALING] = true }, wait = 2 })
+    eq(#X.searches .. " " .. tostring(X.ns.queue.inflight ~= nil), "1 true", "the only query allowed, in flight")
+    eq(progressLine(X), "Checking random-stat items: 0/3 checked", "in flight at the cap: still checking")
+    X.advance(5)
+    eq(progressLine(X), "Lookup limit 1 reached: 0/3 checked, 1 failed", "timed out: stopped at the cap")
+    -- off and on again in the same search: no fresh allowance
+    clickBox(X, false)
+    clickBox(X, true)
+    X.advance(3)
+    eq(#X.searches, 1, "nothing more sent")
+    eq(progressLine(X), "Lookup limit 1 reached: 0/3 checked, 1 failed", "still stopped, the failure kept")
+    X.closeAH()
+    clean(X)
+
+    local Z = exactSession({ slash = "maxqueries 0" })
+    eq(#Z.searches, 0, "cap 0: nothing sent")
+    eq(progressLine(Z), "Lookup limit 0 reached: 0/3 checked", "cap 0 shown as stopped")
+    eq(Z.updaters(), 0, "idle")
+    Z.closeAH()
+    clean(Z)
+end)
+
+-- As seen in the game: a shield's random suffix group with a negative base score was an upgrade once its
+-- auctions were read. Hidden under "Upgrades only" meanwhile, it is still looked up.
+test("exact: a group whose base score is not an upgrade is looked up and confirmed", function()
+    local S1 = "|cnIQ2:|Hitem:801::::::::15:1486:::1:12750::::::|h[Kite Shield of Healing]|h|r"
+    local X = exactSession({ throttle = false, wait = 3,
+        items = { [801] = { name = "Kite Shield", quality = 2, equipLoc = "INVTYPE_SHIELD", cached = true } },
+        sgj = { [801] = -1.5, [S1] = 4 }, auctions = { ["801:" .. HEALING] = { { link = S1, buyout = 1000 } } },
+        results = { result(801, 1000, HEALING) } })
+    eq(X.rowNames(), "", "base score not an upgrade: hidden")
+    eq(countLine(X), "1 gear item \194\183 0 confirmed upgrades \194\183 0 pending", "no estimate either")
+    eq(progressLine(X), "Checking random-stat items: 0/1 checked", "but queued")
+    X.throttleReady = true
+    X.fire("AUCTION_HOUSE_THROTTLED_SYSTEM_READY")
+    X.advance(2)
+    eq(X.rowNames() .. " " .. upgrades(X), "Kite Shield of Healing +4.0%", "its auction: an upgrade")
+    eq(countLine(X), "1 gear item \194\183 1 confirmed upgrade \194\183 0 pending", "confirmed")
+    eq(progressLine(X), "Lookups complete: 1/1 checked", "complete")
+    X.closeAH()
+    clean(X)
+end)
+
 test("exact off: no searches, base scores starred", function()
     local X = exactSession({ slash = "exact off" })
     eq(#X.searches, 0, "nothing sent")
     eq(upgrades(X), "+2.5%*,+3.0%,+2.5%*,+2.5%*", "starred")
-    eq(countLine(X), "5 gear items, 4 upgrades, 0 pending", "no resolving part")
+    eq(countLine(X), "5 gear items · 1 confirmed upgrade · 3 estimated · 0 pending", "starred groups are estimates")
+    eq(progressLine(X), "", "no lookup progress while off")
     local b = X.shownRows()[1]
     b.scripts.OnEnter(b)
     eq(X.G.GameTooltip.lines[1], "AuctionJudge: * base item score. Scan specific items is off", "tooltip note")
@@ -1299,6 +1392,266 @@ test("without SGJ: the panel says so and lists nothing", function()
     local names = {}
     for k in pairs(N.missing) do names[#names + 1] = k end
     eq(#names, 0, "undefined globals read: " .. table.concat(names, ", "))
+end)
+
+---------------------------------------------------------------------------
+-- Search history (AuctionJudgeDB.history) and which search the dump keeps
+---------------------------------------------------------------------------
+
+test("history: one summary per search; empty visits add none; the dump keeps the last search with results", function()
+    local X = exactSession({})
+    local db = X.G.AuctionJudgeDB
+    eq(#db.history, 0, "nothing saved while the search runs")
+    local n = #X.printed
+    X.slash("history")
+    ok(X.printedSince(n, "now: 2026%-11%-15 12:00:00 %(Retribution: Raid%) search; 5 results, 5 rows; lookups: 3 sent, "
+        .. "groups 3/3 done; .*; scan complete$"), "the running search")
+
+    -- replaced by a search whose results cannot be read, then by one closed before it is read
+    local AH = X.G.C_AuctionHouse
+    local getBrowse = AH.GetBrowseResults
+    AH.GetBrowseResults = function() error("not now") end
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.advance(1)
+    AH.GetBrowseResults = getBrowse
+    X.results = { result(601, 30000) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.closeAH()
+    local h = db.history
+    eq(#h, 3, "three searches")
+    local a, b, c = h[1], h[2], h[3]
+    eq(table.concat({ a.start, a.ended, a.stop, a.raw, a.rows, a.lookups, a.failures, a.groups, a.groupsDone, a.spec }, " "),
+        "search replaced complete 5 5 3 0 3 3 Retribution: Raid", "the first search")
+    eq(b.stop .. " " .. b.reads .. " " .. tostring(b.readError:find("not now", 1, true) ~= nil), "read failed 0 true",
+        "the unreadable one")
+    eq(c.stop .. " " .. c.ended .. " " .. tostring(c.readPending), "unread closed nil", "closed before its read")
+    local d = db.lastDump
+    eq(d.why .. " " .. d.writeReason .. " " .. d.rawCount .. " " .. d.search.stop, "replaced closed 5 complete",
+        "the dump: the first search, the last with results")
+    eq(tostring(d.lastReadError) .. " " .. d.exact.sent, "nil 3", "its own read error (none) and lookups, not later ones")
+
+    -- an empty visit: no search, the dump stays
+    X.results = {}
+    X.openAH()
+    X.advance(1)
+    X.closeAH()
+    eq(#db.history, 3, "an empty visit records nothing")
+    ok(db.lastDump == d, "and keeps the dump")
+
+    -- results there on opening; more added, not read; logout then close: recorded once
+    X.results = { result(601, 30000) }
+    X.openAH()
+    X.advance(1)
+    X.results[2] = result(501, 50000, WHALE)
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+    X.fire("PLAYER_LOGOUT")
+    X.closeAH()
+    eq(#db.history, 4, "logout and close: one summary")
+    local e = db.history[4]
+    eq(table.concat({ e.start, e.ended, tostring(e.readPending), e.raw, e.stop }, " "),
+        "open logout true 1 nothing to look up", "read, then more results not read")
+
+    -- more results with no search seen, closed before they are read
+    X.results = {}
+    X.openAH()
+    X.advance(1)
+    X.results = { result(601, 30000) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+    X.closeAH()
+    e = db.history[5]
+    eq(e.start .. " " .. e.stop .. " " .. tostring(e.readPending), "added unread nil", "a search whose start was not seen")
+
+    n = #X.printed
+    X.slash("history")
+    eq(X.printed[n + 1], "|cff33ccffAuctionJudge|r: Searches: 5 recorded (the latest 20 are kept), newest first", "header")
+    ok(X.printed[n + 2]:find("search %(start not seen%); results not read; lookups: 0 sent; scan unread; closed$"),
+        "newest first: " .. X.printed[n + 2])
+    ok(X.printed[n + 3]:find("results there on opening; 1 result, 1 row; .*more results not read yet; logout$"),
+        "singular counts: " .. X.printed[n + 3])
+    clean(X)
+end)
+
+test("history: lookups cut by the cap, or left queued and in flight when replaced; the dump keeps their state", function()
+    local X = exactSession({ slash = "maxqueries 1", wait = 1.6 })
+    local n = #X.printed
+    X.slash("history")
+    ok(X.printedSince(n, "now: .*scan incomplete, 2 queued, one in flight"), "the last allowed lookup in flight: not the cap")
+    X.advance(1)
+    X.results = { result(601, 30000) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.closeAH()
+    local e = X.G.AuctionJudgeDB.history[1]
+    eq(e.stop .. " " .. e.lookups .. " " .. e.queued .. " " .. e.groupsResolved, "cap 1 2 1", "stopped by the cap")
+    clean(X)
+
+    X = exactSession({ wait = 1.6 }) -- the first lookup in flight
+    X.results = { result(601, 30000) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.closeAH()
+    e = X.G.AuctionJudgeDB.history[1]
+    eq(e.stop .. " " .. e.ended .. " " .. e.queued .. " " .. tostring(e.inflight), "incomplete replaced 2 true", "summary")
+    local g = X.G.AuctionJudgeDB.lastDump.groups
+    eq(g[1].query .. " " .. g[2].query .. " " .. g[3].query, "sent queued queued", "the dump: lookup states before the cancel")
+    clean(X)
+end)
+
+test("history: an old saved DB keeps its dump and gets no made-up history; the list keeps the latest 20", function()
+    local Y = Client({ items = { [601] = { name = "Iron Helm", quality = 2, equipLoc = "INVTYPE_HEAD", cached = true } },
+        sgj = { [601] = 3 } })
+    Y.load()
+    local old = { why = "closed", rows = {} }
+    Y.G.AuctionJudgeDB = { exact = false, lastDump = old }
+    Y.fire("ADDON_LOADED", "AuctionJudge")
+    local db = Y.G.AuctionJudgeDB
+    eq(#db.history, 0, "no history built from the old dump")
+    ok(db.lastDump == old, "old dump kept")
+    Y.openAH()
+    for i = 1, 22 do
+        Y.results = {}
+        for j = 1, i do Y.results[j] = result(601, 1000 * j) end
+        Y.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+        Y.advance(0.3)
+    end
+    Y.closeAH()
+    eq(#db.history .. " " .. db.history[1].raw .. " " .. db.history[20].raw, "20 3 22", "the oldest two dropped")
+    db.history[21] = "junk"
+    table.insert(db.history, 1, 7)
+    Y.fire("ADDON_LOADED", "AuctionJudge") -- as after a reload
+    eq(#db.history .. " " .. db.history[1].raw, "20 3", "damaged entries dropped, saved summaries kept")
+    eq(#Y.errors(), 0, "errors: " .. table.concat(Y.errors(), " / "))
+end)
+
+---------------------------------------------------------------------------
+-- Required levels: items above the player's level stay listed (Hide unusable on) with a "Requires 15"
+-- label beside the name; an auction's own link decides its level; delayed levels and level-ups redraw.
+---------------------------------------------------------------------------
+
+local function vestLink(bonus)
+    return "|cnIQ2:|Hitem:803::::::::15:1486:::1:" .. bonus .. "::::::|h[Initiate Vest of Healing]|h|r"
+end
+local V1, V2, V3 = vestLink(13001), vestLink(13002), vestLink(13003)
+local LONG = "Zealot Helm of the Extraordinarily Long Name"
+
+local function levelSession()
+    local list = {
+        [801] = { name = LONG, equipLoc = "INVTYPE_HEAD", cached = true, minLevel = 15 },
+        [802] = { name = "Squire Boots", equipLoc = "INVTYPE_FEET", cached = true, minLevel = 10 },
+        -- the group's base item says 14; its auctions' links say 15, unreadable, and 11
+        [803] = { name = "Initiate Vest", equipLoc = "INVTYPE_CHEST", cached = true, minLevel = 14,
+            linkLevels = { [V1] = 15, [V2] = "secret", [V3] = 11 } },
+        [804] = { name = "Late Gloves", equipLoc = "INVTYPE_HANDS", cached = true, minLevel = "secret" },
+        [805] = { name = "Keyed Belt", equipLoc = "INVTYPE_WAIST", cached = true, minLevel = 10 },
+    }
+    local L = Client({ items = list, sgj = { [801] = 5, [802] = 4, [803] = 3, [804] = 2, [805] = 1 },
+        auctions = { ["803:" .. HEALING] = { { link = V1, buyout = 1000 }, { link = V2, buyout = 1100 },
+            { link = V3, buyout = 1200 } } },
+        keyLevels = { ["805:60:0"] = 13, ["805:63:0"] = 16 } })
+    L.playerLevel = 12
+    L.load()
+    L.fire("ADDON_LOADED", "AuctionJudge")
+    L.openAH()
+    L.results = { result(801, 10000), result(802, 10000), result(803, 10000, HEALING), result(804, 10000),
+        result(805, 10000) }
+    L.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    L.advance(4)
+    return L, list
+end
+
+local function rowBy(L, pred)
+    for _, b in ipairs(L.shownRows()) do if pred(b.row) then return b end end
+end
+local function byLink(link) return function(r) return r.link == link end end
+local function byItem(id) return function(r) return r.itemID == id and not r.isAuction end end
+local function label(b) return b.level.shown and b.level.text or "-" end
+
+test("level: rows above the player's level are listed with Hide unusable and labelled beside the name", function()
+    local L = levelSession()
+    local db = L.G.AuctionJudgeDB
+    ok(db.hideUnusable and db.upgradesOnly, "Hide unusable and Upgrades only on")
+    eq(#L.shownRows(), 7, "every row listed: four fixed items, three auctions")
+    local helm = rowBy(L, byItem(801))
+    eq(label(helm), "Requires 15", "label")
+    eq(helm.cells.name.text, LONG, "the name unchanged")
+    eq(helm.cells.name.width .. " " .. helm.level.width, "110 62", "the name gives way, the label keeps its width")
+    eq(helm.level.color[1] .. "," .. helm.level.color[2], "1,0.35", "red")
+    local boots = rowBy(L, byItem(802))
+    eq(label(boots) .. " " .. boots.cells.name.width, "- 176", "at or below the player's level: no label, full name")
+    -- the auctions of a random suffix group, each by its own link: 15, unreadable (no label, not the group's
+    -- 14), and 11 (below the group's)
+    eq(label(rowBy(L, byLink(V1))) .. "|" .. label(rowBy(L, byLink(V2))) .. "|" .. label(rowBy(L, byLink(V3))),
+        "Requires 15|-|-", "auction rows")
+    eq(label(rowBy(L, byItem(805))), "Requires 13", "the item key's level wins over the item info's")
+    -- clicks keep the plain name and the item link
+    L.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED") -- nothing new; just checks clicks after a re-read
+    L.advance(0.5)
+    helm = rowBy(L, byItem(801))
+    helm.scripts.OnClick(helm, "LeftButton")
+    eq(L.searched, LONG, "search by the name")
+    L.chatOpen, L.shift = true, true
+    helm.scripts.OnClick(helm, "LeftButton")
+    eq(L.inserted, helm.row.link, "shift-click inserts the item link")
+    L.chatOpen, L.shift = false, false
+    -- the player's level is read once per redraw, scrolling included
+    local n = L.calls.UnitLevel
+    local p = L.panel()
+    p.scripts.OnMouseWheel(p, -1)
+    eq(L.calls.UnitLevel - n, 1, "one read for a redraw of seven rows")
+    clean(L)
+end)
+
+test("level: delayed and unreadable levels, a cheaper variant, and a level-up while idle", function()
+    local L, list = levelSession()
+    local gloves = rowBy(L, byItem(804))
+    eq(gloves.row.state .. " " .. label(gloves), "scored -", "unreadable level: scored, no label")
+    -- the level becomes readable: the next item data event labels the row without judging it again
+    local scored = L.calls.ScoreItem
+    list[804].minLevel = 15
+    L.fire("GET_ITEM_INFO_RECEIVED", 804, true)
+    L.advance(0.3)
+    eq(label(rowBy(L, byItem(804))), "Requires 15", "delayed level shown")
+    eq(L.calls.ScoreItem, scored, "not judged again")
+    -- Key data arrives after the boots have been scored from base item info (level 10).
+    local keyLevel, original = 16, L.G.C_AuctionHouse.GetItemKeyRequiredLevel
+    L.G.C_AuctionHouse.GetItemKeyRequiredLevel = function(key)
+        if key.itemID == 802 then return keyLevel end
+        return original(key)
+    end
+    L.fire("EXTRA_BROWSE_INFO_RECEIVED", 802)
+    L.advance(0.3)
+    eq(label(rowBy(L, byItem(802))), "Requires 16", "the browse key supersedes the base item")
+    keyLevel = 0
+    L.fire("EXTRA_BROWSE_INFO_RECEIVED", 802)
+    L.advance(0.3)
+    eq(label(rowBy(L, byItem(802))), "-", "the key explicitly reports no requirement")
+    eq(rowBy(L, byItem(802)).row.minLevel, 0, "known zero is distinct from missing key data")
+    eq(L.calls.ScoreItem, scored, "key updates do not rescore the item")
+    -- an auction link whose level stays unreadable is not read forever
+    for _ = 1, 6 do L.fire("GET_ITEM_INFO_RECEIVED", 803, true) end
+    local v2 = rowBy(L, byLink(V2)).row
+    eq(v2.levelMisses .. " " .. tostring(v2.minLevel), L.ns.Model.MAX_LEVEL_MISSES .. " nil", "capped, still unknown")
+    -- a cheaper item level variant of the belt takes its row: the item key's level for that variant
+    L.results[#L.results + 1] = result(805, 5000, 0, 63)
+    L.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+    L.advance(2)
+    eq(label(rowBy(L, byItem(805))), "Requires 16", "the shown variant's level")
+    -- level-up with the panel idle; UnitLevel still gives 12 during the event
+    L.advance(2)
+    eq(L.updaters(), 0, "idle")
+    L.fire("PLAYER_LEVEL_UP", 15)
+    L.advance(0.3)
+    eq(label(rowBy(L, byItem(801))) .. "|" .. label(rowBy(L, byLink(V1))) .. "|" .. label(rowBy(L, byItem(805))),
+        "-|-|Requires 16", "redrawn at the new level")
+    -- and SGJ's SCORES_CHANGED (which follows a level-up) redraws at the level UnitLevel gives then
+    L.playerLevel = 16
+    for _, fn in ipairs(L.sgjCallbacks) do fn() end
+    L.advance(1)
+    eq(label(rowBy(L, byItem(805))), "-", "no labels left")
+    L.closeAH()
+    local d = L.G.AuctionJudgeDB.lastDump
+    local src = {}
+    for _, r in ipairs(d.rows) do src[r.link] = tostring(r.minLevel) .. " " .. tostring(r.minLevelSource) end
+    eq(src[V1] .. "|" .. src[V2], "15 link|nil nil", "levels and their sources in the dump")
+    clean(L)
 end)
 
 return H

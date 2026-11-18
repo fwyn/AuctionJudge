@@ -44,14 +44,25 @@ function Q.Hold(q, now)
     if t > q.holdUntil then q.holdUntil = t end
 end
 
----A new browse search replaced the results, or the auction house closed: groups not done are forgotten
----(they can be queued again), the query in flight is dropped and the per-search count starts again.
-function Q.Cancel(q)
+---Exact mode turned off: groups not done are forgotten (they can be queued again) and the query in flight
+---is dropped. The per-search counts stay: turning it on again gives the same search no fresh allowance.
+function Q.Stop(q)
     for _, g in ipairs(q.items) do
         local s = g.query and g.query.state
         if s == "queued" or s == "sent" then g.query = nil end
     end
-    q.items, q.inflight, q.sent = {}, nil, 0
+    q.items, q.inflight = {}, nil
+end
+
+---Start a new search budget. When the old rows have been kept for diagnostics, detach the queue
+---without changing the last recorded state of those rows.
+function Q.Cancel(q, keepQueryStates)
+    if keepQueryStates then
+        q.items, q.inflight = {}, nil
+    else
+        Q.Stop(q)
+    end
+    q.sent, q.failures = 0, 0
 end
 
 ---A query in flight for TIMEOUT seconds counts as failed. Returns that group, or nil.
