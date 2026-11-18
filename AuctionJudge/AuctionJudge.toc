@@ -2,7 +2,7 @@
 ## Title: AuctionJudge
 ## Notes: Judges the gear on the auction house for your character: upgrade and value per auction, using Sharpie's Gear Judge.
 ## Author: Ferawyn
-## Version: 1.0.0
+## Version: 1.1.0
 ## Dependencies: SharpiesGearJudge
 ## X-Category: Auction & Economy
 ## X-License: MIT
