@@ -645,7 +645,7 @@ end)
 test("the same results again use the score cache", function()
     local before = C.calls.ScoreItem
     C.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
-    C.advance(0.5)
+    C.advance(0.6) -- the read, then a batch for the random suffix groups (their item info is not cached), then a redraw
     eq(C.calls.ScoreItem, before, "no new scoring")
 end)
 
@@ -681,7 +681,7 @@ test("SCORES_CHANGED rescores everything", function()
     local before = C.calls.ScoreItem
     C.factor = 2
     for _, fn in ipairs(C.sgjCallbacks) do fn() end
-    C.advance(0.1)
+    C.advance(0.2) -- a redraw at most 0.2 s away; 66 rows take four batches
     local pending
     for _, t in ipairs(C.texts()) do pending = pending or tonumber(t:match("^%d+ gear items, %d+ upgrades, (%d+) pending")) end
     ok(pending and pending > 0, "pending while rescoring: " .. tostring(pending))
@@ -1164,6 +1164,80 @@ test("Scan specific items checkbox: off lists starred groups and cancels the que
     X.slash("exact off")
     X.advance(0.5)
     eq(exactBox(X).checked, false, "box follows /aj exact off")
+    X.closeAH()
+    clean(X)
+end)
+
+-- As seen in the game: the same random suffix group searched again showed browse price 999 instead of 449,
+-- but the auction rows read for the first search stayed listed and no item search was sent.
+test("exact: a fresh search clears the list and looks a group up again; more results of the same search do not", function()
+    local X = exactSession({})
+    local hkey = "501:" .. HEALING
+    local function group() return X.ns.store.byKey[hkey] end
+    local first = group()
+    local function lateReply() -- an item search event for the key, e.g. a late reply to the old query
+        X.fire("ITEM_SEARCH_RESULTS_ADDED", { itemID = 501, itemLevel = 60, itemSuffix = HEALING, battlePetSpeciesID = 0 })
+    end
+    eq(X.shownRows()[1].cells.price.text, "coin:449", "first search: the auction's price")
+
+    -- more results of the same search: the rows and their auctions stay, nothing searched again
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+    X.advance(3)
+    eq(#X.searches, 3, "no new searches")
+    ok(group() == first, "the same group row")
+    eq(#first.auctions, 2, "auction rows kept")
+
+    -- the auctions change; the user searches for the group again
+    X.auctions = { [hkey] = { { link = H1, buyout = 999 } } }
+    X.results = { result(501, 999, HEALING), result(601, 30000) }
+    local scored = #X.scoredLinks
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    lateReply()
+    eq(group(), nil, "old rows dropped at once; a late reply finds no group")
+    X.step() -- drawn at the next frame, before the debounced read
+    eq(X.rowNames(), "", "empty while the new results are not read")
+    X.advance(0.6) -- the read, a batch for the group (its item info is not cached), then a redraw
+    lateReply()
+    eq(group().auctions, nil, "a late reply after the read is not taken for the new search")
+    eq(X.rowNames(), "Cadet Vest of Healing,Iron Helm", "the new results")
+    eq(upgrades(X) .. " " .. X.shownRows()[1].cells.price.text, "+2.5%*,+3.0% coin:999", "the group starred, at the new browse price")
+    X.advance(3)
+    eq(searched(X), "501:" .. HEALING .. ",501:" .. WHALE .. ",501:" .. INTELLECT .. ",501:" .. HEALING,
+        "the group looked up again")
+    eq(X.rowNames(), "Cadet Vest of Healing,Iron Helm", "one auction row")
+    eq(upgrades(X) .. " " .. X.shownRows()[1].cells.price.text, "+15.4%,+3.0% coin:999", "exact, at the new price")
+    eq(#X.scoredLinks, scored, "every score came from the session cache")
+    local n = #X.printed
+    X.slash("status")
+    ok(X.printedSince(n, "1 sent this search"), "the cap counts this search only")
+
+    -- exact off during a new search: on again looks the group up
+    clickBox(X, false)
+    X.auctions = { [hkey] = { { link = H2, buyout = 500 } } }
+    X.results = { result(501, 500, HEALING) }
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.advance(3)
+    eq(#X.searches, 4, "off: nothing searched")
+    clickBox(X, true)
+    eq(upgrades(X), "+2.5%*", "on: starred until looked up")
+    X.advance(3)
+    eq(#X.searches, 5, "looked up")
+    eq(upgrades(X) .. " " .. X.shownRows()[1].cells.price.text, "+9.0% coin:500", "the new auction")
+
+    -- a new search whose results cannot be read: nothing stale listed, no lookups until a read succeeds
+    local AH = X.G.C_AuctionHouse
+    local getBrowse = AH.GetBrowseResults
+    AH.GetBrowseResults = function() error("not now") end
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_UPDATED")
+    X.advance(3)
+    eq(X.rowNames(), "", "empty, not the old rows or their browse price")
+    eq(#X.searches, 5, "nothing searched")
+    eq(X.updaters(), 0, "idle")
+    AH.GetBrowseResults = getBrowse
+    X.fire("AUCTION_HOUSE_BROWSE_RESULTS_ADDED")
+    X.advance(3)
+    eq(#X.searches, 6, "looked up once the results are read")
+    eq(upgrades(X), "+9.0%", "exact again")
     X.closeAH()
     clean(X)
 end)

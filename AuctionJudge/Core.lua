@@ -424,11 +424,15 @@ end
 
 function handlers.AUCTION_HOUSE_BROWSE_RESULTS_UPDATED()
     if not open then return end
-    -- a new search: its groups are queued afresh after the read
+    -- a new search replaced the results: the old rows go now (their auctions, browse prices and item searches
+    -- are stale; a late item search reply finds no group). The list stays empty until the new results are
+    -- read; groups judged before are scored from the session caches and looked up afresh.
     Q.Cancel(queue)
+    M.Clear(store)
     Q.Hold(queue, GetTime())
     Panel.ResetScroll()
     scheduleRead()
+    markDirty()
 end
 
 function handlers.AUCTION_HOUSE_BROWSE_RESULTS_ADDED()

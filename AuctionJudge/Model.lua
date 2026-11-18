@@ -109,7 +109,7 @@ local function recount(store)
     store.nextDue = n > 0 and 0 or huge
 end
 
----Forgets the rows (the auction house closed); the session caches stay.
+---Forgets the rows (a new browse search, or the auction house closed); the session caches stay.
 function M.Clear(store)
     store.rows, store.byKey, store.byItem = {}, {}, {}
     store.skipped, store.skippedCount = {}, 0
