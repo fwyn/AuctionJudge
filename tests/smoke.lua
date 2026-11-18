@@ -531,7 +531,7 @@ end)
 
 test("results arrive: gear kept, duplicates priced low, uncached items wait", function()
     C.results = {
-        result(101, 50000),            -- 4.2% at 5g: 0.84 %/g
+        result(101, 50000),            -- 4.2% at 5g: 0.84%/g
         result(102, 20000, 1200),      -- Bandit's Cloak of the Bear: 1.5% at 2g
         result(103, 400000),           -- uncached: 8% at 40g
         result(104, 15000),            -- uncached: 2% at 1.5g
@@ -571,7 +571,7 @@ test("rows show quality colour, coin text, upgrade and value", function()
     eq(b.cells.price.text, "coin:50000", "coin text")
     eq(b.cells.upgrade.text, "+4.2%", "upgrade")
     eq(b.cells.upgrade.color[2], 1, "green")
-    eq(b.cells.value.text, "0.84 %/g", "value")
+    eq(b.cells.value.text, "0.84%/g", "value")
 end)
 
 test("uncached items resolve on GET_ITEM_INFO_RECEIVED and get scored", function()
@@ -706,7 +706,7 @@ test("SCORES_CHANGED rescores everything", function()
     local b = C.shownRows()[1]
     eq(b.cells.name.text, "Heavy Boots", "still first")
     eq(b.cells.upgrade.text, "+4.0%", "new score")
-    eq(b.cells.value.text, "2.67 %/g", "new value")
+    eq(b.cells.value.text, "2.67%/g", "new value")
 end)
 
 test("SGJ not ready: rows wait, then score", function()
@@ -865,10 +865,10 @@ test("unreadable equip locations are unknown, not 'not gear'", function()
     secretItems[402].secretFull = false
     S.advance(3)
     eq(belt.state, "scored", "scored on a retry once readable")
-    -- belt: 2% at 50s = 4 %/g, shown per silver; gloves: 3% at 1g = 3 %/g
+    -- belt: 2% at 50s = 4%/g, shown per silver; gloves: 3% at 1g = 3%/g
     eq(S.rowNames(), "Masked Belt,Veiled Gloves", "both listed, by the true ratio")
-    eq(S.shownRows()[1].cells.value.text, "0.04 %/s", "per silver under 1 gold")
-    eq(S.shownRows()[2].cells.value.text, "3.00 %/g", "per gold")
+    eq(S.shownRows()[1].cells.value.text, "0.04%/s", "per silver under 1 gold")
+    eq(S.shownRows()[2].cells.value.text, "3.00%/g", "per gold")
     S.fire("PLAYER_LOGOUT")
     local d = S.G.AuctionJudgeDB.lastDump
     eq(d.why .. " " .. #d.rows, "logout 2", "dump on logout with the auction house open")

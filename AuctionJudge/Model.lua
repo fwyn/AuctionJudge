@@ -840,16 +840,15 @@ function M.FormatUpgrade(row)
     return "error", "bad"
 end
 
----Value text: v is % per gold. Shown per silver ("0.84 %/s") when the price is under 1 gold, per gold
----("0.84 %/g") otherwise; sorting always uses v itself. Empty without a value.
+---Value text: v is % per gold. Shown per silver ("0.84%/s") when the price is under 1 gold, per gold
+---("0.84%/g") otherwise; sorting always uses v itself. Empty without a value.
 function M.FormatValue(v, price)
     if type(v) ~= "number" then return "" end
     local unit = "g"
     if type(price) == "number" and price < 10000 then v, unit = v / 100, "s" end
-    if v >= 100 then return format("%.0f %%/%s", v, unit) end
-    if v >= 10 then return format("%.1f %%/%s", v, unit) end
-    if v >= 0.01 then return format("%.2f %%/%s", v, unit) end
-    return format("%.2g %%/%s", v, unit)
+    if v >= 100 then return format("%.0f%%/%s", v, unit) end
+    if v >= 10 then return format("%.1f%%/%s", v, unit) end
+    return format("%.2f%%/%s", v, unit)
 end
 
 local function plural(n, one, many) return format("%d %s", n, n == 1 and one or many) end
